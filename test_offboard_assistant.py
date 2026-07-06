@@ -141,6 +141,27 @@ class OffboardAssistantTests(unittest.TestCase):
             self.assertEqual(migrated, [oa.BASELINE_FILE])
             self.assertEqual((target / oa.BASELINE_FILE).read_text(encoding="utf-8"), '{"baseline": true}')
 
+    def test_detect_secret_references_masks_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".env"
+            secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+            path.write_text(f"OPENAI_API_KEY={secret}\n", encoding="utf-8")
+            findings = oa.detect_secret_references(path)
+            self.assertEqual(findings[0]["kind"], "OpenAI API key")
+            self.assertFalse(findings[0]["value_recorded"])
+            self.assertNotIn(secret, str(findings))
+
+    def test_sensitive_scan_includes_secret_findings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / ".claude"
+            config_dir.mkdir()
+            path = config_dir / "config.json"
+            path.write_text('{"api_key": "sk-ant-abcdefghijklmnopqrstuvwxyz123456"}', encoding="utf-8")
+            items = oa.scan_sensitive_locations([root])
+            kinds = {finding["kind"] for finding in items[0]["secret_findings"]}
+            self.assertIn("Anthropic API key", kinds)
+
 
 if __name__ == "__main__":
     unittest.main()

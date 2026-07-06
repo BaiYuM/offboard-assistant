@@ -469,7 +469,12 @@ def describe_item(item: dict[str, Any]) -> tuple[str, str, str]:
     if item_type == "environment_variable":
         return (f"{item.get('scope')}:{item.get('name')}", "value_recorded=false", str(when))
     if item_type == "sensitive_file_location":
-        return (str(item.get("path") or ""), "contents_recorded=false", str(when))
+        findings = item.get("secret_findings") or []
+        kinds = sorted({finding.get("kind") for finding in findings if finding.get("kind")})
+        detail = f"contents_recorded=false; secret_findings={len(findings)}"
+        if kinds:
+            detail += f"; kinds={', '.join(kinds)}"
+        return (str(item.get("path") or ""), detail, str(when))
     if item_type == "chat_data_location":
         return (f"{item.get('app')} - {item.get('path')}", "contents_recorded=false", str(when))
     if item_type == "install_activity_event":

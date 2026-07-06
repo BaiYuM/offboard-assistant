@@ -102,7 +102,47 @@ python .\offboard_assistant.py report --rescan --scan-root E:\job
 - 用户和系统环境变量名称。
 - Chrome、Edge、Brave、Firefox 的保存登录项元数据。
 - `.env`、`.npmrc`、`.pypirc`、SSH key、`*token*`、`*secret*` 等敏感文件位置。
+- 常见 API key/token 内容特征，包含 OpenAI、Anthropic、GitHub、AWS、Google、Slack 和通用 `api_key`/`token`/`secret` 赋值。
 - 微信、企业微信、钉钉、飞书、Slack、Teams、Telegram、Discord 的常见数据目录位置。
+
+## API 密钥识别
+
+工具会对用户指定目录和常见 AI/开发工具配置目录做本地扫描，例如：
+
+- `.env`
+- `.npmrc`
+- `.pypirc`
+- `.claude`
+- `.codex`
+- `.cursor`
+- `.config`
+- `%APPDATA%\cc-switch`
+- `%APPDATA%\ccswitch`
+- `%APPDATA%\Claude`
+- `%APPDATA%\Cursor`
+
+识别结果只保存：
+
+- 密钥类型
+- 所在文件路径
+- 行号
+- 脱敏片段
+- hash 指纹
+
+不会保存完整 API key、token 或密码值。
+
+对于 CC SWITCH 或类似工具，如果它把大量 API 密钥放在配置文件里，通常可以识别出大部分常见格式。准确性取决于密钥格式和存储位置。建议把对应配置目录加入 `--scan-root`，例如：
+
+```powershell
+python .\offboard_assistant.py scan --scan-root "$env:APPDATA\cc-switch"
+python .\offboard_assistant.py scan --scan-root "$env:APPDATA\ccswitch"
+```
+
+删除策略：
+
+- 先到 OpenAI、Anthropic、GitHub、云厂商等平台撤销或轮换密钥。
+- 再根据清理动作建议删除或重写本地配置文件。
+- 默认不自动删除密钥文件，避免误删个人账号或仍在使用的配置。
 
 ## 安装行为监听
 

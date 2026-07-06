@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import sqlite3
 import sys
@@ -73,6 +74,50 @@ DEFAULT_SCAN_DIR_NAMES = {
     "source",
     "repos",
 }
+
+AI_APP_CONFIG_DIR_NAMES = {
+    ".aws",
+    ".azure",
+    ".claude",
+    ".codex",
+    ".config",
+    ".cursor",
+    ".gemini",
+    ".openai",
+    ".ssh",
+}
+
+SECRET_CONTENT_EXTENSIONS = {
+    "",
+    ".conf",
+    ".config",
+    ".env",
+    ".ini",
+    ".json",
+    ".jsonc",
+    ".properties",
+    ".rc",
+    ".toml",
+    ".txt",
+    ".yaml",
+    ".yml",
+}
+
+SECRET_PROVIDER_PATTERNS = [
+    ("OpenAI API key", re.compile(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}\b")),
+    ("Anthropic API key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b")),
+    ("GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{30,}\b")),
+    ("AWS access key id", re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")),
+    ("Google API key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
+    ("Slack token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b")),
+    ("Generic bearer token", re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{24,}\b")),
+    (
+        "Generic secret assignment",
+        re.compile(
+            r"(?i)\b(?:api[_-]?key|secret|token|access[_-]?key|private[_-]?key|password)\b\s*[:=]\s*[\"']?([A-Za-z0-9._~+/=-]{16,})"
+        ),
+    ),
+]
 
 PATH_LIKE_ENV_NAMES = {
     "ANDROID_HOME",
@@ -176,6 +221,17 @@ def mask_identifier(value: str | None) -> str | None:
     if len(value) <= 3:
         return value[:1] + "***"
     return value[:2] + "***" + value[-1:]
+
+
+def mask_secret(value: str) -> str:
+    value = value.strip().strip('"').strip("'")
+    if len(value) <= 12:
+        return value[:2] + "***"
+    return value[:6] + "***" + value[-4:]
+
+
+def secret_fingerprint(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()[:16]
 
 
 def ensure_state_dir(base: Path) -> Path:
@@ -785,6 +841,29 @@ def default_scan_roots() -> list[Path]:
         candidate = home / name
         if candidate.exists():
             roots.append(candidate)
+    for name in AI_APP_CONFIG_DIR_NAMES:
+        candidate = home / name
+        if candidate.exists():
+            roots.append(candidate)
+    appdata = Path(os.environ.get("APPDATA", ""))
+    localappdata = Path(os.environ.get("LOCALAPPDATA", ""))
+    for root in (appdata, localappdata):
+        if not root.exists():
+            continue
+        for name in (
+            "cc-switch",
+            "ccswitch",
+            "Claude",
+            "Claude Code",
+            "Cursor",
+            "Code",
+            "Windsurf",
+            "OpenAI",
+            "Anthropic",
+        ):
+            candidate = root / name
+            if candidate.exists():
+                roots.append(candidate)
     unique: dict[str, Path] = {}
     for root in roots:
         try:
@@ -799,6 +878,65 @@ def is_sensitive_name(path: Path) -> bool:
     if name in SENSITIVE_FILENAMES:
         return True
     return any(fnmatch.fnmatch(name, pattern) for pattern in SENSITIVE_PATTERNS)
+
+
+def should_scan_file_contents(path: Path) -> bool:
+    if is_sensitive_name(path):
+        return True
+    if path.suffix.lower() not in SECRET_CONTENT_EXTENSIONS:
+        return False
+    lowered = safe_rel(path).lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "cc-switch",
+            "ccswitch",
+            "claude",
+            "codex",
+            "cursor",
+            "openai",
+            "anthropic",
+            "windsurf",
+            ".config",
+            ".aws",
+            ".azure",
+        )
+    )
+
+
+def detect_secret_references(path: Path, max_bytes: int = 2 * 1024 * 1024) -> list[dict[str, Any]]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return []
+    if stat.st_size > max_bytes:
+        return []
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return []
+    findings: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, str]] = set()
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        if len(line) > 20000:
+            continue
+        for kind, pattern in SECRET_PROVIDER_PATTERNS:
+            for match in pattern.finditer(line):
+                secret = match.group(1) if match.lastindex else match.group(0)
+                key = (kind, line_no, secret_fingerprint(secret))
+                if key in seen:
+                    continue
+                seen.add(key)
+                findings.append(
+                    {
+                        "kind": kind,
+                        "line": line_no,
+                        "masked": mask_secret(secret),
+                        "fingerprint": secret_fingerprint(secret),
+                        "value_recorded": False,
+                    }
+                )
+    return findings
 
 
 def scan_sensitive_locations(roots: list[Path], max_files: int = 20000) -> list[dict[str, Any]]:
@@ -826,8 +964,9 @@ def scan_sensitive_locations(roots: list[Path], max_files: int = 20000) -> list[
                 break
             for filename in filenames:
                 path = Path(dirpath) / filename
-                if not is_sensitive_name(path):
+                if not is_sensitive_name(path) and not should_scan_file_contents(path):
                     continue
+                secret_findings = detect_secret_references(path) if should_scan_file_contents(path) else []
                 found.append(
                     {
                         "id": stable_id(["secret-location", safe_rel(path)]),
@@ -836,6 +975,8 @@ def scan_sensitive_locations(roots: list[Path], max_files: int = 20000) -> list[
                         "name": path.name,
                         "modified_at": mtime_iso(path),
                         "contents_recorded": False,
+                        "secret_findings": secret_findings,
+                        "secret_findings_count": len(secret_findings),
                     }
                 )
         if visited > max_files:
@@ -980,6 +1121,7 @@ def write_csv(path: Path, items: list[dict[str, Any]]) -> None:
         "password_modified_at",
         "detected_at",
         "install_paths",
+        "secret_findings_count",
     ]
     with path.open("w", newline="", encoding="utf-8-sig") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
@@ -1033,7 +1175,15 @@ def render_report(since: dt.datetime, snapshot: dict[str, Any], candidates: list
                 details = ["value_recorded=false"]
             elif item_type == "sensitive_file_location":
                 label = item.get("path", "")
-                details = [f"modified={item.get('modified_at') or 'unknown'}", "contents_recorded=false"]
+                findings = item.get("secret_findings") or []
+                kinds = sorted({finding.get("kind") for finding in findings if finding.get("kind")})
+                details = [
+                    f"modified={item.get('modified_at') or 'unknown'}",
+                    "contents_recorded=false",
+                    f"secret_findings={len(findings)}",
+                ]
+                if kinds:
+                    details.append(f"kinds={'; '.join(kinds)}")
             elif item_type == "chat_data_location":
                 label = f"{item.get('app')} - {item.get('path')}"
                 details = [f"modified={item.get('modified_at') or 'unknown'}", "contents_recorded=false"]
@@ -1239,6 +1389,8 @@ def cleanup_action_for_item(item: dict[str, Any]) -> dict[str, Any]:
 
     if item_type == "sensitive_file_location":
         path = item.get("path") or ""
+        findings = item.get("secret_findings") or []
+        kinds = sorted({finding.get("kind") for finding in findings if finding.get("kind")})
         action["title"] = str(path)
         action["risk"] = "high_if_file_contains_personal_data"
         action["manual_steps"] = [
@@ -1246,6 +1398,10 @@ def cleanup_action_for_item(item: dict[str, Any]) -> dict[str, Any]:
             "Revoke tokens from the provider before deleting local copies.",
             "Delete or redact only after confirming it is not needed by personal projects.",
         ]
+        if kinds:
+            action["detected_secret_kinds"] = kinds
+            action["manual_steps"].insert(1, f"Detected secret types: {', '.join(kinds)}.")
+            action["manual_steps"].insert(2, "Prefer revoking/rotating these keys at the provider before local cleanup.")
         return action
 
     if item_type == "chat_data_location":
@@ -1322,6 +1478,11 @@ def render_cleanup_actions_markdown(actions: list[dict[str, Any]]) -> str:
             lines.append("- Related paths:")
             for path in related_paths[:20]:
                 lines.append(f"  - `{path}`")
+        detected_kinds = action.get("detected_secret_kinds") or []
+        if detected_kinds:
+            lines.append("- Detected secret kinds:")
+            for kind in detected_kinds:
+                lines.append(f"  - `{kind}`")
         lines.append("")
     return "\n".join(lines)
 
