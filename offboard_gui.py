@@ -177,6 +177,20 @@ class OffboardGui(tk.Tk):
         ttk.Entry(self.ai_tab, textvariable=self.ai_api_key_var, show="*").grid(row=row, column=1, sticky="ew", pady=4)
 
         row += 1
+        ttk.Label(self.ai_tab, text="勾选策略").grid(row=row, column=0, sticky="w", pady=4)
+        self.ai_selection_policy_var = tk.StringVar(value="离职模式：勾选 select + review")
+        ttk.Combobox(
+            self.ai_tab,
+            textvariable=self.ai_selection_policy_var,
+            values=[
+                "保守模式：只勾选 select",
+                "离职模式：勾选 select + review",
+                "激进模式：勾选 select + review + 低风险 keep",
+            ],
+            state="readonly",
+        ).grid(row=row, column=1, sticky="ew", pady=4)
+
+        row += 1
         buttons = ttk.Frame(self.ai_tab)
         buttons.grid(row=row, column=0, columnspan=2, sticky="w", pady=(10, 6))
         ttk.Button(buttons, text="审核全部候选项并自动勾选", command=lambda: self.run_ai_review(use_selected=False)).pack(
@@ -191,7 +205,8 @@ class OffboardGui(tk.Tk):
         note = (
             "AI 审核会把脱敏元数据发送到你配置的 API：路径、分类、密钥类型、脱敏摘要、时间等。\n"
             "不会发送明文 API key、密码、Cookie 或聊天正文。API Key 只在内存中使用，不保存。\n"
-            "AI 只负责推荐勾选和总结，隔离/清理仍需要你手动确认。"
+            "AI 只负责推荐勾选和总结，隔离/清理仍需要你手动确认。\n"
+            "离职模式会把 review 项也勾上，适合统一处理离职残留。"
         )
         ttk.Label(self.ai_tab, text=note, justify="left").grid(row=row, column=0, columnspan=2, sticky="w")
 
@@ -406,7 +421,8 @@ class OffboardGui(tk.Tk):
             messagebox.showerror("AI 审核失败", str(exc))
             self.set_status("AI 审核失败。")
             return
-        for item_id in result.get("selected_ids", []):
+        selected_by_ai = self.ai_selected_ids_for_policy(result)
+        for item_id in selected_by_ai:
             self.selected_ids.add(str(item_id))
         self.render_tree()
         self.ai_output.delete("1.0", "end")
@@ -423,7 +439,27 @@ class OffboardGui(tk.Tk):
                 "end",
                 f"- {decision.get('action')} / {decision.get('risk')} / {decision.get('id')}: {decision.get('reason')}\n",
             )
-        self.set_status(f"AI 已推荐勾选 {len(result.get('selected_ids', []))} 项。请确认后再隔离或导出清单。")
+        self.set_status(f"AI 已按当前策略勾选 {len(selected_by_ai)} 项。请确认后再隔离或导出清单。")
+
+    def ai_selected_ids_for_policy(self, result: dict[str, Any]) -> set[str]:
+        policy = self.ai_selection_policy_var.get()
+        selected = {str(item_id) for item_id in result.get("selected_ids", [])}
+        for decision in result.get("decisions", []):
+            item_id = str(decision.get("id", ""))
+            action = str(decision.get("action", "")).lower()
+            risk = str(decision.get("risk", "")).lower()
+            if not item_id:
+                continue
+            if "保守" in policy:
+                if action == "select":
+                    selected.add(item_id)
+            elif "离职" in policy:
+                if action in {"select", "review"}:
+                    selected.add(item_id)
+            elif "激进" in policy:
+                if action in {"select", "review"} or (action == "keep" and risk == "low"):
+                    selected.add(item_id)
+        return selected
 
     def fetch_ai_models(self) -> None:
         self.set_status("正在获取模型列表...")

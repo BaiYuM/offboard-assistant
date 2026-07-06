@@ -1153,6 +1153,10 @@ def scan_chat_locations() -> list[dict[str, Any]]:
                 "path": safe_rel(path),
                 "modified_at": mtime_iso(path),
                 "contents_recorded": False,
+                "account_scope": "unknown",
+                "recommendation": "chat_account_review",
+                "category": "chat_data",
+                "category_label": "聊天数据位置",
             }
         )
     return rows
@@ -1562,6 +1566,38 @@ def cleanup_action_for_item(item: dict[str, Any]) -> dict[str, Any]:
         app = item.get("app") or "chat app"
         action["title"] = f"{app}: {item.get('path')}"
         action["risk"] = "high_if_chat_history_needed"
+        action["category"] = "chat_data"
+        action["category_label"] = "聊天数据位置"
+        action["recommendation"] = "chat_account_review"
+        action["chat_cleanup_modes"] = [
+            {
+                "mode": "personal_account",
+                "label": "个人账号：先加密备份，再清理公司电脑本地残留",
+                "steps": [
+                    "Confirm this is a personal account and not a company/customer communication archive.",
+                    "Use the app's official export/backup feature if available.",
+                    "Encrypt the backup before uploading to personal cloud storage.",
+                    "After verifying the backup, logout and clean local cache/history from the company computer.",
+                ],
+            },
+            {
+                "mode": "company_account",
+                "label": "公司账号：不备份内容，只走交接/归档后清本地残留",
+                "steps": [
+                    "Do not upload company/customer chat contents to personal cloud storage.",
+                    "Follow company handover or compliance archival process.",
+                    "Logout from the app and clean local cache/residue after handover is complete.",
+                ],
+            },
+            {
+                "mode": "unknown",
+                "label": "不确定：先人工确认账号归属",
+                "steps": [
+                    "Open the app and confirm whether the logged-in account is personal or company-owned.",
+                    "Do not delete or upload the data directory until account ownership is clear.",
+                ],
+            },
+        ]
         action["manual_steps"] = [
             f"Open {app} and use its official logout or cache cleanup option first.",
             "Confirm whether chat history belongs to a company account or personal account.",
@@ -1643,6 +1679,13 @@ def render_cleanup_actions_markdown(actions: list[dict[str, Any]]) -> str:
             lines.append("- Detected secret kinds:")
             for kind in detected_kinds:
                 lines.append(f"  - `{kind}`")
+        chat_modes = action.get("chat_cleanup_modes") or []
+        if chat_modes:
+            lines.append("- Chat cleanup modes:")
+            for mode in chat_modes:
+                lines.append(f"  - `{mode.get('mode')}` {mode.get('label')}")
+                for step in mode.get("steps", []):
+                    lines.append(f"    - {step}")
         lines.append("")
     return "\n".join(lines)
 

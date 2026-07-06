@@ -215,6 +215,19 @@ class OffboardAssistantTests(unittest.TestCase):
         data = ai_reviewer.extract_json_object('```json\n{"selected_ids": ["a"]}\n```')
         self.assertEqual(data["selected_ids"], ["a"])
 
+    def test_chat_cleanup_action_has_account_modes(self):
+        action = oa.cleanup_action_for_item(
+            {
+                "id": "chat-1",
+                "type": "chat_data_location",
+                "app": "WeChat",
+                "path": r"C:\Users\Lenovo\Documents\WeChat Files",
+            }
+        )
+        modes = {mode["mode"] for mode in action["chat_cleanup_modes"]}
+        self.assertEqual(modes, {"personal_account", "company_account", "unknown"})
+        self.assertFalse(action["automatic"])
+
 
 if __name__ == "__main__":
     unittest.main()
