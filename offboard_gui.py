@@ -26,6 +26,8 @@ class OffboardGui(tk.Tk):
         self.state_dir = core.state_dir_from_arg(str(state_base) if state_base else None)
         self.candidates: list[dict[str, Any]] = []
         self.selected_ids: set[str] = set()
+        self.sort_column = "recommendation"
+        self.sort_reverse = False
 
         self._build_layout()
         self._load_sync_config()
@@ -65,6 +67,10 @@ class OffboardGui(tk.Tk):
         toolbar = ttk.Frame(self.dashboard)
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
 
+        ttk.Label(toolbar, text="基线日期").pack(side="left", padx=(0, 4))
+        self.baseline_since_var = tk.StringVar(value="2026-03-15")
+        ttk.Entry(toolbar, textvariable=self.baseline_since_var, width=12).pack(side="left", padx=(0, 6))
+        ttk.Button(toolbar, text="建立/覆盖基线", command=self.init_baseline_from_gui).pack(side="left", padx=(0, 10))
         ttk.Button(toolbar, text="刷新", command=lambda: self.refresh_data(rescan=False)).pack(side="left", padx=(0, 6))
         ttk.Button(toolbar, text="重新扫描", command=lambda: self.refresh_data(rescan=True)).pack(side="left", padx=(0, 6))
         ttk.Button(toolbar, text="生成报告", command=self.generate_report).pack(side="left", padx=(0, 6))
@@ -74,20 +80,24 @@ class OffboardGui(tk.Tk):
         ttk.Button(toolbar, text="标记选中已处理", command=self.mark_selected_handled).pack(side="left", padx=(0, 6))
         ttk.Button(toolbar, text="打开状态目录", command=self.open_state_dir).pack(side="left")
 
-        columns = ("selected", "type", "confidence", "title", "time", "detail")
+        columns = ("selected", "category", "recommendation", "type", "confidence", "title", "time", "detail")
         self.tree = ttk.Treeview(self.dashboard, columns=columns, show="headings", selectmode="browse")
-        self.tree.heading("selected", text="选中")
-        self.tree.heading("type", text="类型")
-        self.tree.heading("confidence", text="置信度")
-        self.tree.heading("title", text="对象")
-        self.tree.heading("time", text="时间")
-        self.tree.heading("detail", text="说明")
+        self.tree.heading("selected", text="选中", command=lambda: self.sort_by("selected"))
+        self.tree.heading("category", text="分类", command=lambda: self.sort_by("category"))
+        self.tree.heading("recommendation", text="推荐", command=lambda: self.sort_by("recommendation"))
+        self.tree.heading("type", text="类型", command=lambda: self.sort_by("type"))
+        self.tree.heading("confidence", text="置信度", command=lambda: self.sort_by("confidence"))
+        self.tree.heading("title", text="对象", command=lambda: self.sort_by("title"))
+        self.tree.heading("time", text="时间", command=lambda: self.sort_by("time"))
+        self.tree.heading("detail", text="说明", command=lambda: self.sort_by("detail"))
         self.tree.column("selected", width=55, anchor="center", stretch=False)
-        self.tree.column("type", width=160, stretch=False)
-        self.tree.column("confidence", width=210, stretch=False)
-        self.tree.column("title", width=280)
+        self.tree.column("category", width=150, stretch=False)
+        self.tree.column("recommendation", width=160, stretch=False)
+        self.tree.column("type", width=150, stretch=False)
+        self.tree.column("confidence", width=190, stretch=False)
+        self.tree.column("title", width=260)
         self.tree.column("time", width=180, stretch=False)
-        self.tree.column("detail", width=360)
+        self.tree.column("detail", width=320)
         self.tree.grid(row=1, column=0, sticky="nsew")
         self.tree.bind("<Double-1>", self.toggle_current_selection)
         self.tree.bind("<space>", self.toggle_current_selection)
@@ -260,6 +270,8 @@ class OffboardGui(tk.Tk):
                 self.set_status(f"未找到基线。请点击重新扫描前先建立基线。状态目录：{self.state_dir}")
                 return
             baseline = core.read_json(baseline_path)
+            if baseline.get("baseline_since"):
+                self.baseline_since_var.set(str(baseline.get("baseline_since", ""))[:10])
             snapshot_path = self.state_dir / core.SNAPSHOT_FILE
             if rescan or not snapshot_path.exists():
                 snapshot = core.collect_snapshot(self.state_dir, core.default_scan_roots())
@@ -282,7 +294,7 @@ class OffboardGui(tk.Tk):
     def render_tree(self) -> None:
         for row in self.tree.get_children():
             self.tree.delete(row)
-        for item in self.candidates:
+        for item in self.sorted_candidates():
             item_id = str(item.get("id"))
             title, detail, when = describe_item(item)
             self.tree.insert(
@@ -291,6 +303,8 @@ class OffboardGui(tk.Tk):
                 iid=item_id,
                 values=(
                     "✓" if item_id in self.selected_ids else "",
+                    item.get("category_label") or default_category_label(item),
+                    item.get("recommendation") or default_recommendation(item),
                     item.get("type", ""),
                     item.get("cleanup_confidence", ""),
                     title,
@@ -303,6 +317,52 @@ class OffboardGui(tk.Tk):
             counts[str(item.get("type", "unknown"))] = counts.get(str(item.get("type", "unknown")), 0) + 1
         summary = " | ".join(f"{key}: {value}" for key, value in sorted(counts.items())) or "无候选项"
         self.summary_var.set(summary)
+
+    def sorted_candidates(self) -> list[dict[str, Any]]:
+        def key(item: dict[str, Any]) -> tuple[int, str]:
+            title, detail, when = describe_item(item)
+            values = {
+                "selected": "0" if str(item.get("id")) in self.selected_ids else "1",
+                "category": item.get("category_label") or default_category_label(item),
+                "recommendation": item.get("recommendation") or default_recommendation(item),
+                "type": item.get("type", ""),
+                "confidence": item.get("cleanup_confidence", ""),
+                "title": title,
+                "time": when,
+                "detail": detail,
+            }
+            priority = recommendation_priority(str(values["recommendation"]))
+            if self.sort_column == "recommendation":
+                return (priority, str(values[self.sort_column]).lower())
+            return (0, str(values.get(self.sort_column, "")).lower())
+
+        return sorted(self.candidates, key=key, reverse=self.sort_reverse)
+
+    def sort_by(self, column: str) -> None:
+        if self.sort_column == column:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_column = column
+            self.sort_reverse = False
+        self.render_tree()
+
+    def init_baseline_from_gui(self) -> None:
+        since = self.baseline_since_var.get().strip()
+        if not since:
+            messagebox.showerror("缺少日期", "请输入基线日期，例如 2026-03-15。")
+            return
+        if not messagebox.askyesno("覆盖基线", f"将覆盖当前基线并使用日期 {since}。是否继续？"):
+            return
+        try:
+            core.parse_since(since)
+            snapshot = core.collect_snapshot(self.state_dir, core.default_scan_roots())
+            snapshot["baseline_since"] = core.parse_since(since).isoformat()
+            core.write_json(self.state_dir / core.BASELINE_FILE, snapshot)
+            self.selected_ids.clear()
+            self.refresh_data(rescan=True)
+            self.set_status(f"基线已建立：{self.state_dir / core.BASELINE_FILE}")
+        except Exception as exc:
+            messagebox.showerror("建立基线失败", str(exc))
 
     def toggle_current_selection(self, _event: object | None = None) -> None:
         focused = self.tree.focus()
@@ -649,6 +709,47 @@ def describe_item(item: dict[str, Any]) -> tuple[str, str, str]:
             str(when),
         )
     return (str(item.get("id") or "unknown"), json.dumps(item, ensure_ascii=False)[:240], str(when))
+
+
+def default_category_label(item: dict[str, Any]) -> str:
+    item_type = str(item.get("type", ""))
+    if item_type == "browser_login_metadata":
+        return "浏览器登录"
+    if item_type == "chat_data_location":
+        return "聊天数据位置"
+    if item_type == "environment_variable":
+        return "环境变量"
+    if item_type == "installed_app":
+        return "已安装软件"
+    if item_type == "install_activity_event":
+        return "安装行为"
+    return "未分类"
+
+
+def default_recommendation(item: dict[str, Any]) -> str:
+    item_type = str(item.get("type", ""))
+    if item_type == "browser_login_metadata":
+        return "manual_review"
+    if item_type == "chat_data_location":
+        return "manual_review"
+    if item_type == "environment_variable":
+        return "review_required"
+    if item_type == "installed_app":
+        return "review_required"
+    if item_type == "install_activity_event":
+        return "review_required"
+    return "review_required"
+
+
+def recommendation_priority(value: str) -> int:
+    order = {
+        "recommend_cleanup": 0,
+        "prioritize_revoke_then_clean": 1,
+        "review_required": 2,
+        "manual_review": 3,
+        "keep": 4,
+    }
+    return order.get(value, 9)
 
 
 def main() -> int:

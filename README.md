@@ -173,6 +173,8 @@ python .\offboard_assistant.py scan --scan-root "$env:APPDATA\ccswitch"
 `offboard_gui.py` 提供一个本地桌面窗口：
 
 - 查看候选清理项：浏览器登录元数据、聊天数据目录、安装行为、环境变量、敏感文件位置。
+- 在窗口中设置基线日期并建立/覆盖基线，不需要回到 CLI。
+- 点击列表表头按分类、推荐等级、类型、时间等排序。
 - 双击候选项进行勾选。
 - 导出选中清理动作清单，包含风险等级、人工步骤和可复制命令。
 - 导出 AI 审核包，内容只包含脱敏元数据，不包含密钥值、密码或聊天正文。
@@ -212,6 +214,7 @@ python .\offboard_assistant.py scan --scan-root "$env:APPDATA\ccswitch"
 - 在 GUI 的“AI 审核”页填写 Base URL、模型和 API Key。
 - 默认 Base URL 是 `https://api.openai.com/v1`，也可以填兼容 OpenAI Chat Completions 的第三方或自建服务。
 - 点击“审核全部候选项并自动勾选”后，AI 会返回摘要、推荐勾选 ID 和理由。
+- AI 返回推荐 ID 后，GUI 会自动勾选这些候选项。
 - API Key 只在内存中使用，不保存到配置文件。
 - 发送给 AI 的内容包含路径、分类、密钥类型、脱敏摘要、时间等元数据。
 - 不发送明文 API key、token、密码、Cookie 或聊天正文。
