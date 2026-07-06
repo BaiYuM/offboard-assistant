@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local app state and privacy-sensitive data
+.offboard-assistant/
+*.enc
+*.env
+.env
+.env.*
+*.key
+*.pem
+
+# Packaging output
+build/
+dist/
+*.spec
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
