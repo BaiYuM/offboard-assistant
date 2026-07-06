@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 import offboard_assistant as oa
+import ai_reviewer
 import sync_bundle
 
 
@@ -193,6 +194,22 @@ class OffboardAssistantTests(unittest.TestCase):
         payload = oa.ai_review_payload_for_items(items)
         self.assertNotIn(secret, json.dumps(payload, ensure_ascii=False))
         self.assertEqual(payload["items"][0]["secret_kinds"], ["OpenAI API key"])
+
+    def test_ai_review_result_filters_unknown_ids(self):
+        result = ai_reviewer.normalize_review_result(
+            {
+                "summary": "ok",
+                "selected_ids": ["known", "unknown"],
+                "decisions": [
+                    {"id": "known", "action": "select", "risk": "low", "reason": "cache"},
+                    {"id": "unknown", "action": "select", "risk": "low", "reason": "invented"},
+                ],
+                "warnings": ["check"],
+            },
+            {"known"},
+        )
+        self.assertEqual(result["selected_ids"], ["known"])
+        self.assertEqual(len(result["decisions"]), 1)
 
 
 if __name__ == "__main__":

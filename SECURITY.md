@@ -21,6 +21,9 @@ It may:
 - Store chat application data directory paths without message contents.
 - Store installation metadata and paths.
 - Upload encrypted sync bundles when the user provides a passphrase.
+- Send metadata-only AI review payloads to a user-configured API endpoint when the user explicitly starts AI review.
+
+AI review payloads may include local paths, categories, timestamps, masked usernames, and secret types. They must not include plaintext secret values.
 
 ## Reporting Issues
 
@@ -34,4 +37,3 @@ Please report security issues privately if possible. Include:
 ## Handling Sensitive Test Data
 
 Do not attach real browser databases, chat logs, `.env` files, API keys, or exported sync bundles to public issues.
-

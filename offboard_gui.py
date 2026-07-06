@@ -11,6 +11,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any
 
+import ai_reviewer
 import offboard_assistant as core
 import sync_bundle
 
@@ -38,15 +39,18 @@ class OffboardGui(tk.Tk):
 
         self.dashboard = ttk.Frame(notebook, padding=10)
         self.sync_tab = ttk.Frame(notebook, padding=10)
+        self.ai_tab = ttk.Frame(notebook, padding=10)
         self.background_tab = ttk.Frame(notebook, padding=10)
         self.guide_tab = ttk.Frame(notebook, padding=10)
         notebook.add(self.dashboard, text="清理清单")
         notebook.add(self.sync_tab, text="云同步/导入导出")
+        notebook.add(self.ai_tab, text="AI 审核")
         notebook.add(self.background_tab, text="后台任务")
         notebook.add(self.guide_tab, text="说明")
 
         self._build_dashboard()
         self._build_sync_tab()
+        self._build_ai_tab()
         self._build_background_tab()
         self._build_guide_tab()
 
@@ -139,6 +143,47 @@ class OffboardGui(tk.Tk):
             "坚果云一般使用 WebDAV 地址，例如 https://dav.jianguoyun.com/dav/你的目录。"
         )
         ttk.Label(self.sync_tab, text=note, justify="left").grid(row=row, column=0, columnspan=2, sticky="w", pady=(12, 0))
+
+    def _build_ai_tab(self) -> None:
+        self.ai_tab.columnconfigure(1, weight=1)
+        row = 0
+        ttk.Label(self.ai_tab, text="Base URL").grid(row=row, column=0, sticky="w", pady=4)
+        self.ai_base_url_var = tk.StringVar(value=ai_reviewer.DEFAULT_BASE_URL)
+        ttk.Entry(self.ai_tab, textvariable=self.ai_base_url_var).grid(row=row, column=1, sticky="ew", pady=4)
+
+        row += 1
+        ttk.Label(self.ai_tab, text="模型").grid(row=row, column=0, sticky="w", pady=4)
+        self.ai_model_var = tk.StringVar(value=ai_reviewer.DEFAULT_MODEL)
+        ttk.Entry(self.ai_tab, textvariable=self.ai_model_var).grid(row=row, column=1, sticky="ew", pady=4)
+
+        row += 1
+        ttk.Label(self.ai_tab, text="API Key").grid(row=row, column=0, sticky="w", pady=4)
+        self.ai_api_key_var = tk.StringVar()
+        ttk.Entry(self.ai_tab, textvariable=self.ai_api_key_var, show="*").grid(row=row, column=1, sticky="ew", pady=4)
+
+        row += 1
+        buttons = ttk.Frame(self.ai_tab)
+        buttons.grid(row=row, column=0, columnspan=2, sticky="w", pady=(10, 6))
+        ttk.Button(buttons, text="审核全部候选项并自动勾选", command=lambda: self.run_ai_review(use_selected=False)).pack(
+            side="left", padx=(0, 6)
+        )
+        ttk.Button(buttons, text="只审核已勾选项", command=lambda: self.run_ai_review(use_selected=True)).pack(
+            side="left", padx=(0, 6)
+        )
+        ttk.Button(buttons, text="清空 AI 勾选", command=self.clear_selection).pack(side="left")
+
+        row += 1
+        note = (
+            "AI 审核会把脱敏元数据发送到你配置的 API：路径、分类、密钥类型、脱敏摘要、时间等。\n"
+            "不会发送明文 API key、密码、Cookie 或聊天正文。API Key 只在内存中使用，不保存。\n"
+            "AI 只负责推荐勾选和总结，隔离/清理仍需要你手动确认。"
+        )
+        ttk.Label(self.ai_tab, text=note, justify="left").grid(row=row, column=0, columnspan=2, sticky="w")
+
+        row += 1
+        self.ai_output = tk.Text(self.ai_tab, wrap="word", height=18)
+        self.ai_output.grid(row=row, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+        self.ai_tab.rowconfigure(row, weight=1)
 
     def _build_background_tab(self) -> None:
         self.background_tab.columnconfigure(0, weight=1)
@@ -269,8 +314,51 @@ class OffboardGui(tk.Tk):
             self.selected_ids.add(focused)
         self.render_tree()
 
+    def clear_selection(self) -> None:
+        self.selected_ids.clear()
+        self.render_tree()
+        self.set_status("已清空勾选。")
+
     def selected_items(self) -> list[dict[str, Any]]:
         return [item for item in self.candidates if str(item.get("id")) in self.selected_ids]
+
+    def run_ai_review(self, use_selected: bool) -> None:
+        items = self.selected_items() if use_selected else self.candidates
+        if not items:
+            messagebox.showinfo("没有候选项", "当前没有可审核的候选项。")
+            return
+        payload = core.ai_review_payload_for_items(items)
+        self.set_status("AI 审核中，请稍候...")
+        self.update_idletasks()
+        try:
+            result = ai_reviewer.review_with_openai_compatible(
+                api_key=self.ai_api_key_var.get(),
+                base_url=self.ai_base_url_var.get().strip(),
+                model=self.ai_model_var.get().strip(),
+                payload=payload,
+            )
+        except Exception as exc:
+            messagebox.showerror("AI 审核失败", str(exc))
+            self.set_status("AI 审核失败。")
+            return
+        for item_id in result.get("selected_ids", []):
+            self.selected_ids.add(str(item_id))
+        self.render_tree()
+        self.ai_output.delete("1.0", "end")
+        self.ai_output.insert("end", f"摘要：{result.get('summary', '')}\n\n")
+        warnings = result.get("warnings") or []
+        if warnings:
+            self.ai_output.insert("end", "警告：\n")
+            for warning in warnings:
+                self.ai_output.insert("end", f"- {warning}\n")
+            self.ai_output.insert("end", "\n")
+        self.ai_output.insert("end", "决策：\n")
+        for decision in result.get("decisions", []):
+            self.ai_output.insert(
+                "end",
+                f"- {decision.get('action')} / {decision.get('risk')} / {decision.get('id')}: {decision.get('reason')}\n",
+            )
+        self.set_status(f"AI 已推荐勾选 {len(result.get('selected_ids', []))} 项。请确认后再隔离或导出清单。")
 
     def generate_report(self) -> None:
         try:
