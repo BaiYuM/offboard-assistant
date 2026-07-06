@@ -84,6 +84,25 @@ def normalize_review_result(data: dict[str, Any], allowed_ids: set[str]) -> dict
     }
 
 
+def list_openai_compatible_models(*, api_key: str, base_url: str, timeout: int = 30) -> list[str]:
+    if not api_key.strip():
+        raise ValueError("API key is required.")
+    base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
+    request = urllib.request.Request(base_url + "/models", method="GET")
+    request.add_header("Authorization", f"Bearer {api_key.strip()}")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response_body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Model list request failed: {exc}") from exc
+    models: list[str] = []
+    for item in response_body.get("data", []):
+        model_id = item.get("id")
+        if model_id:
+            models.append(str(model_id))
+    return sorted(set(models))
+
+
 def review_with_openai_compatible(
     *,
     api_key: str,

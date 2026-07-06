@@ -164,7 +164,12 @@ class OffboardGui(tk.Tk):
         row += 1
         ttk.Label(self.ai_tab, text="模型").grid(row=row, column=0, sticky="w", pady=4)
         self.ai_model_var = tk.StringVar(value=ai_reviewer.DEFAULT_MODEL)
-        ttk.Entry(self.ai_tab, textvariable=self.ai_model_var).grid(row=row, column=1, sticky="ew", pady=4)
+        model_frame = ttk.Frame(self.ai_tab)
+        model_frame.grid(row=row, column=1, sticky="ew", pady=4)
+        model_frame.columnconfigure(0, weight=1)
+        self.ai_model_combo = ttk.Combobox(model_frame, textvariable=self.ai_model_var)
+        self.ai_model_combo.grid(row=0, column=0, sticky="ew")
+        ttk.Button(model_frame, text="获取模型列表", command=self.fetch_ai_models).grid(row=0, column=1, padx=(6, 0))
 
         row += 1
         ttk.Label(self.ai_tab, text="API Key").grid(row=row, column=0, sticky="w", pady=4)
@@ -419,6 +424,23 @@ class OffboardGui(tk.Tk):
                 f"- {decision.get('action')} / {decision.get('risk')} / {decision.get('id')}: {decision.get('reason')}\n",
             )
         self.set_status(f"AI 已推荐勾选 {len(result.get('selected_ids', []))} 项。请确认后再隔离或导出清单。")
+
+    def fetch_ai_models(self) -> None:
+        self.set_status("正在获取模型列表...")
+        self.update_idletasks()
+        try:
+            models = ai_reviewer.list_openai_compatible_models(
+                api_key=self.ai_api_key_var.get(),
+                base_url=self.ai_base_url_var.get().strip(),
+            )
+        except Exception as exc:
+            messagebox.showerror("获取模型列表失败", str(exc))
+            self.set_status("获取模型列表失败。可继续手动输入模型名。")
+            return
+        self.ai_model_combo["values"] = models
+        if models and self.ai_model_var.get() not in models:
+            self.ai_model_var.set(models[0])
+        self.set_status(f"已获取 {len(models)} 个模型。")
 
     def generate_report(self) -> None:
         try:

@@ -211,6 +211,10 @@ class OffboardAssistantTests(unittest.TestCase):
         self.assertEqual(result["selected_ids"], ["known"])
         self.assertEqual(len(result["decisions"]), 1)
 
+    def test_extract_json_object_handles_fenced_json(self):
+        data = ai_reviewer.extract_json_object('```json\n{"selected_ids": ["a"]}\n```')
+        self.assertEqual(data["selected_ids"], ["a"])
+
 
 if __name__ == "__main__":
     unittest.main()

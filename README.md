@@ -213,6 +213,7 @@ python .\offboard_assistant.py scan --scan-root "$env:APPDATA\ccswitch"
 
 - 在 GUI 的“AI 审核”页填写 Base URL、模型和 API Key。
 - 默认 Base URL 是 `https://api.openai.com/v1`，也可以填兼容 OpenAI Chat Completions 的第三方或自建服务。
+- 点击“获取模型列表”会请求 `{Base URL}/models`，自动填充模型下拉框；如果服务不支持，可手动输入模型名。
 - 点击“审核全部候选项并自动勾选”后，AI 会返回摘要、推荐勾选 ID 和理由。
 - AI 返回推荐 ID 后，GUI 会自动勾选这些候选项。
 - API Key 只在内存中使用，不保存到配置文件。
