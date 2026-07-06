@@ -14,13 +14,13 @@ import sync_bundle
 
 
 class OffboardGui(tk.Tk):
-    def __init__(self, state_base: Path) -> None:
+    def __init__(self, state_base: Path | None) -> None:
         super().__init__()
         self.title("Offboard Assistant")
         self.geometry("1180x760")
         self.minsize(980, 620)
-        self.state_base = state_base
-        self.state_dir = core.ensure_state_dir(state_base)
+        self.state_base = state_base or core.default_state_base()
+        self.state_dir = core.state_dir_from_arg(str(state_base) if state_base else None)
         self.candidates: list[dict[str, Any]] = []
         self.selected_ids: set[str] = set()
 
@@ -208,7 +208,7 @@ class OffboardGui(tk.Tk):
             if not baseline_path.exists():
                 self.candidates = []
                 self.render_tree()
-                self.set_status("未找到基线。请先运行 CLI: python .\\offboard_assistant.py init --since YYYY-MM-DD")
+                self.set_status(f"未找到基线。请点击重新扫描前先建立基线。状态目录：{self.state_dir}")
                 return
             baseline = core.read_json(baseline_path)
             snapshot_path = self.state_dir / core.SNAPSHOT_FILE
@@ -226,7 +226,7 @@ class OffboardGui(tk.Tk):
                 item["after_since"] = True
                 self.candidates.append(item)
             self.render_tree()
-            self.set_status(f"已加载 {len(self.candidates)} 个候选项。")
+            self.set_status(f"已加载 {len(self.candidates)} 个候选项。状态目录：{self.state_dir}")
         except Exception as exc:
             messagebox.showerror("刷新失败", str(exc))
 
@@ -485,7 +485,7 @@ def describe_item(item: dict[str, Any]) -> tuple[str, str, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Offboard Assistant desktop GUI.")
-    parser.add_argument("--state-dir", default=".", help="Directory containing .offboard-assistant.")
+    parser.add_argument("--state-dir", help="Directory containing .offboard-assistant. Default: %%APPDATA%%\\OffboardAssistant.")
     parser.add_argument("--background-watch-install", action="store_true", help="Run install monitor without opening GUI.")
     parser.add_argument("--background-scan", action="store_true", help="Run one snapshot scan without opening GUI.")
     parser.add_argument("--watch-dir", action="append", default=[], help="Directory to watch in background install mode.")
@@ -498,7 +498,7 @@ def main() -> int:
     if args.background_scan:
         args.scan_root = []
         return core.command_scan(args)
-    app = OffboardGui(Path(args.state_dir))
+    app = OffboardGui(Path(args.state_dir) if args.state_dir else None)
     app.mainloop()
     return 0
 

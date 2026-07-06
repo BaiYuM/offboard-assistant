@@ -32,6 +32,7 @@ except ImportError:  # pragma: no cover - only available on Windows
 
 
 APP_DIR = ".offboard-assistant"
+APP_NAME = "OffboardAssistant"
 BASELINE_FILE = "baseline.json"
 SNAPSHOT_FILE = "latest-snapshot.json"
 REPORT_FILE = "offboarding-report.md"
@@ -181,6 +182,49 @@ def ensure_state_dir(base: Path) -> Path:
     state_dir = base / APP_DIR
     state_dir.mkdir(parents=True, exist_ok=True)
     return state_dir
+
+
+def default_state_base() -> Path:
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        return Path(appdata) / APP_NAME
+    return Path.home() / APP_NAME
+
+
+def state_dir_from_arg(value: str | None) -> Path:
+    if value:
+        return ensure_state_dir(Path(value))
+    base = default_state_base()
+    base.mkdir(parents=True, exist_ok=True)
+    state_dir = ensure_state_dir(base)
+    migrate_legacy_state_if_needed(state_dir)
+    return state_dir
+
+
+def migrate_legacy_state_if_needed(target_state_dir: Path) -> list[str]:
+    legacy_state_dir = Path.cwd() / APP_DIR
+    if not legacy_state_dir.exists() or legacy_state_dir.resolve() == target_state_dir.resolve():
+        return []
+    migrated: list[str] = []
+    for filename in (
+        BASELINE_FILE,
+        SNAPSHOT_FILE,
+        INSTALL_MONITOR_STATE_FILE,
+        INSTALL_EVENTS_FILE,
+        REPORT_FILE,
+        "cleanup-actions.md",
+        "handled-items.json",
+    ):
+        source = legacy_state_dir / filename
+        target = target_state_dir / filename
+        if not source.exists() or target.exists():
+            continue
+        try:
+            shutil.copy2(source, target)
+            migrated.append(filename)
+        except OSError:
+            continue
+    return migrated
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -1012,7 +1056,7 @@ def render_report(since: dt.datetime, snapshot: dict[str, Any], candidates: list
 
 
 def command_init(args: argparse.Namespace) -> int:
-    state_dir = ensure_state_dir(Path(args.state_dir))
+    state_dir = state_dir_from_arg(args.state_dir)
     roots = [Path(path) for path in args.scan_root] if args.scan_root else default_scan_roots()
     snapshot = collect_snapshot(state_dir, roots)
     baseline_path = state_dir / BASELINE_FILE
@@ -1029,7 +1073,7 @@ def command_init(args: argparse.Namespace) -> int:
 
 
 def command_scan(args: argparse.Namespace) -> int:
-    state_dir = ensure_state_dir(Path(args.state_dir))
+    state_dir = state_dir_from_arg(args.state_dir)
     roots = [Path(path) for path in args.scan_root] if args.scan_root else default_scan_roots()
     snapshot = collect_snapshot(state_dir, roots)
     snapshot_path = state_dir / SNAPSHOT_FILE
@@ -1041,7 +1085,7 @@ def command_scan(args: argparse.Namespace) -> int:
 
 
 def command_report(args: argparse.Namespace) -> int:
-    state_dir = ensure_state_dir(Path(args.state_dir))
+    state_dir = state_dir_from_arg(args.state_dir)
     baseline_path = state_dir / BASELINE_FILE
     if not baseline_path.exists():
         print(f"Missing baseline: {baseline_path}", file=sys.stderr)
@@ -1105,7 +1149,7 @@ def load_candidates_for_state(state_dir: Path, since_override: str | None, resca
 
 
 def command_actions(args: argparse.Namespace) -> int:
-    state_dir = ensure_state_dir(Path(args.state_dir))
+    state_dir = state_dir_from_arg(args.state_dir)
     try:
         _snapshot, candidates, _since = load_candidates_for_state(state_dir, args.since, args.rescan, args.scan_root)
     except FileNotFoundError as exc:
@@ -1283,7 +1327,7 @@ def render_cleanup_actions_markdown(actions: list[dict[str, Any]]) -> str:
 
 
 def command_watch_install(args: argparse.Namespace) -> int:
-    state_dir = ensure_state_dir(Path(args.state_dir))
+    state_dir = state_dir_from_arg(args.state_dir)
     state_path = state_dir / INSTALL_MONITOR_STATE_FILE
     events_path = state_dir / INSTALL_EVENTS_FILE
     watch_dirs = [Path(path) for path in args.watch_dir] if args.watch_dir else default_install_watch_dirs()
@@ -1322,8 +1366,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--state-dir",
-        default=".",
-        help="Directory that contains the .offboard-assistant state folder. Default: current directory.",
+        help="Directory that contains the .offboard-assistant state folder. Default: %%APPDATA%%\\OffboardAssistant.",
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
 

@@ -27,14 +27,14 @@ build_exe.ps1               Windows EXE 打包脚本
 如果使用已打包版本：
 
 ```powershell
-.\dist\OffboardAssistant\OffboardAssistant.exe --state-dir E:\job
+.\dist\OffboardAssistant\OffboardAssistant.exe
 ```
 
 如果从源码运行：
 
 ```powershell
 python .\offboard_assistant.py init --since 2026-07-06 --scan-root E:\job
-python .\offboard_gui.py --state-dir E:\job
+python .\offboard_gui.py
 ```
 
 ## 使用
@@ -84,8 +84,10 @@ python .\offboard_assistant.py watch-install --interval 60
 默认状态目录：
 
 ```text
-.\.offboard-assistant\
+%APPDATA%\OffboardAssistant\.offboard-assistant\
 ```
+
+旧版本曾默认使用当前目录下的 `.\.offboard-assistant\`。新版本首次启动时会尝试把旧状态文件迁移到 `%APPDATA%\OffboardAssistant\.offboard-assistant\`，之后双击 EXE 即可使用。
 
 你也可以限制敏感文件扫描范围，避免扫描整个用户目录：
 
@@ -174,8 +176,8 @@ python -m PyInstaller --noconfirm --windowed --name OffboardAssistant --add-data
 EXE 也支持后台参数，供 Windows 计划任务调用：
 
 ```powershell
-.\dist\OffboardAssistant\OffboardAssistant.exe --state-dir E:\job --background-watch-install --interval 60 --iterations 720
-.\dist\OffboardAssistant\OffboardAssistant.exe --state-dir E:\job --background-scan
+.\dist\OffboardAssistant\OffboardAssistant.exe --background-watch-install --interval 60 --iterations 720
+.\dist\OffboardAssistant\OffboardAssistant.exe --background-scan
 ```
 
 也可以在 GUI 的“后台任务”页创建：

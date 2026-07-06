@@ -122,6 +122,25 @@ class OffboardAssistantTests(unittest.TestCase):
         self.assertEqual(action["risk"], "high_if_wrong_account")
         self.assertTrue(action["manual_steps"])
 
+    def test_migrate_legacy_state_copies_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / oa.APP_DIR
+            target = root / "new" / oa.APP_DIR
+            legacy.mkdir()
+            target.mkdir(parents=True)
+            (legacy / oa.BASELINE_FILE).write_text('{"baseline": true}', encoding="utf-8")
+            original_cwd = Path.cwd()
+            try:
+                import os
+
+                os.chdir(root)
+                migrated = oa.migrate_legacy_state_if_needed(target)
+            finally:
+                os.chdir(original_cwd)
+            self.assertEqual(migrated, [oa.BASELINE_FILE])
+            self.assertEqual((target / oa.BASELINE_FILE).read_text(encoding="utf-8"), '{"baseline": true}')
+
 
 if __name__ == "__main__":
     unittest.main()
