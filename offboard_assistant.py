@@ -119,6 +119,51 @@ SECRET_PROVIDER_PATTERNS = [
     ),
 ]
 
+PATH_CATEGORY_RULES = [
+    (
+        "codex_temp_plugin_cache",
+        ("/.codex/.tmp/plugins/",),
+        "Codex 临时插件缓存",
+        "recommend_cleanup",
+    ),
+    (
+        "codex_temp_cache",
+        ("/.codex/.tmp/",),
+        "Codex 临时缓存",
+        "recommend_cleanup",
+    ),
+    (
+        "ai_tool_config",
+        ("/.codex/", "/.claude/", "/.cursor/"),
+        "AI/开发工具配置",
+        "review_required",
+    ),
+    (
+        "cloud_cli_config",
+        ("/.aws/", "/.azure/"),
+        "云服务 CLI 配置",
+        "review_required",
+    ),
+    (
+        "ssh_config",
+        ("/.ssh/",),
+        "SSH 配置/密钥",
+        "review_required",
+    ),
+    (
+        "environment_file",
+        ("/.env",),
+        "环境变量文件",
+        "review_required",
+    ),
+    (
+        "package_registry_config",
+        ("/.npmrc", "/.pypirc"),
+        "包管理器认证配置",
+        "review_required",
+    ),
+]
+
 PATH_LIKE_ENV_NAMES = {
     "ANDROID_HOME",
     "ANDROID_SDK_ROOT",
@@ -232,6 +277,93 @@ def mask_secret(value: str) -> str:
 
 def secret_fingerprint(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def normalize_path_for_match(path: str) -> str:
+    return path.replace("/", "\\").lower()
+
+
+def categorize_path(path: str) -> dict[str, str]:
+    slash_normalized = path.replace("\\", "/").lower()
+    for category, needles, label, recommendation in PATH_CATEGORY_RULES:
+        for needle in needles:
+            if needle.lower() in slash_normalized:
+                return {
+                    "category": category,
+                    "category_label": label,
+                    "recommendation": recommendation,
+                }
+    return {
+        "category": "sensitive_file",
+        "category_label": "敏感文件位置",
+        "recommendation": "review_required",
+    }
+
+
+def recommended_cleanup_target(item: dict[str, Any]) -> str | None:
+    if item.get("type") != "sensitive_file_location":
+        return None
+    if item.get("recommendation") != "recommend_cleanup":
+        return None
+    path = str(item.get("path") or "")
+    if not path:
+        return None
+    parts = Path(path).parts
+    lowered = [part.lower() for part in parts]
+    category = item.get("category")
+    if category == "codex_temp_plugin_cache":
+        try:
+            dot_codex = lowered.index(".codex")
+            if lowered[dot_codex + 1] == ".tmp" and lowered[dot_codex + 2] == "plugins":
+                return str(Path(*parts[: dot_codex + 3]))
+        except (ValueError, IndexError):
+            return str(Path(path).parent)
+    if category == "codex_temp_cache":
+        try:
+            dot_codex = lowered.index(".codex")
+            if lowered[dot_codex + 1] == ".tmp":
+                return str(Path(*parts[: dot_codex + 2]))
+        except (ValueError, IndexError):
+            return str(Path(path).parent)
+    return path
+
+
+def ai_review_payload_for_items(items: list[dict[str, Any]]) -> dict[str, Any]:
+    review_items: list[dict[str, Any]] = []
+    for item in items:
+        findings = item.get("secret_findings") or []
+        review_items.append(
+            {
+                "id": item.get("id"),
+                "type": item.get("type"),
+                "cleanup_confidence": item.get("cleanup_confidence"),
+                "category": item.get("category"),
+                "category_label": item.get("category_label"),
+                "recommendation": item.get("recommendation"),
+                "path": item.get("path"),
+                "cleanup_target_path": recommended_cleanup_target(item),
+                "origin": item.get("origin"),
+                "browser": item.get("browser"),
+                "profile": item.get("profile"),
+                "app": item.get("app"),
+                "name": item.get("name"),
+                "secret_findings_count": len(findings),
+                "secret_kinds": sorted({finding.get("kind") for finding in findings if finding.get("kind")}),
+                "value_recorded": False,
+                "contents_recorded": item.get("contents_recorded", False),
+                "password_recorded": item.get("password_recorded", False),
+            }
+        )
+    return {
+        "generated_at": utc_now(),
+        "purpose": "AI review payload for cleanup recommendations. Contains metadata only, not secret values.",
+        "safety_rules": [
+            "Do not recommend deleting browser passwords or chat directories without explicit user confirmation.",
+            "Recommend revoking or rotating API keys before local cleanup.",
+            "Prefer quarantine/move-to-backup over permanent deletion.",
+        ],
+        "items": review_items,
+    }
 
 
 def ensure_state_dir(base: Path) -> Path:
@@ -967,16 +1099,22 @@ def scan_sensitive_locations(roots: list[Path], max_files: int = 20000) -> list[
                 if not is_sensitive_name(path) and not should_scan_file_contents(path):
                     continue
                 secret_findings = detect_secret_references(path) if should_scan_file_contents(path) else []
+                path_text = safe_rel(path)
+                category = categorize_path(path_text)
+                if secret_findings:
+                    category = dict(category)
+                    category["recommendation"] = "prioritize_revoke_then_clean"
                 found.append(
                     {
-                        "id": stable_id(["secret-location", safe_rel(path)]),
+                        "id": stable_id(["secret-location", path_text]),
                         "type": "sensitive_file_location",
-                        "path": safe_rel(path),
+                        "path": path_text,
                         "name": path.name,
                         "modified_at": mtime_iso(path),
                         "contents_recorded": False,
                         "secret_findings": secret_findings,
                         "secret_findings_count": len(secret_findings),
+                        **category,
                     }
                 )
         if visited > max_files:
@@ -1181,6 +1319,8 @@ def render_report(since: dt.datetime, snapshot: dict[str, Any], candidates: list
                     f"modified={item.get('modified_at') or 'unknown'}",
                     "contents_recorded=false",
                     f"secret_findings={len(findings)}",
+                    f"category={item.get('category_label') or 'unknown'}",
+                    f"recommendation={item.get('recommendation') or 'review_required'}",
                 ]
                 if kinds:
                     details.append(f"kinds={'; '.join(kinds)}")
@@ -1391,13 +1531,27 @@ def cleanup_action_for_item(item: dict[str, Any]) -> dict[str, Any]:
         path = item.get("path") or ""
         findings = item.get("secret_findings") or []
         kinds = sorted({finding.get("kind") for finding in findings if finding.get("kind")})
+        category = item.get("category")
+        recommendation = item.get("recommendation") or "review_required"
         action["title"] = str(path)
-        action["risk"] = "high_if_file_contains_personal_data"
-        action["manual_steps"] = [
-            "Open the file and identify whether it contains work API keys, tokens, or credentials.",
-            "Revoke tokens from the provider before deleting local copies.",
-            "Delete or redact only after confirming it is not needed by personal projects.",
-        ]
+        action["category"] = category
+        action["category_label"] = item.get("category_label")
+        action["recommendation"] = recommendation
+        if recommendation == "recommend_cleanup":
+            action["risk"] = "low_to_medium"
+            action["cleanup_target_path"] = recommended_cleanup_target(item)
+            action["manual_steps"] = [
+                "Close the related application first.",
+                "This path looks like temporary/cache data and is generally safe to remove after review.",
+                "Prefer deleting the parent cache item through the application if it provides a cleanup option.",
+            ]
+        else:
+            action["risk"] = "high_if_file_contains_personal_data"
+            action["manual_steps"] = [
+                "Open the file and identify whether it contains work API keys, tokens, or credentials.",
+                "Revoke tokens from the provider before deleting local copies.",
+                "Delete or redact only after confirming it is not needed by personal projects.",
+            ]
         if kinds:
             action["detected_secret_kinds"] = kinds
             action["manual_steps"].insert(1, f"Detected secret types: {', '.join(kinds)}.")
@@ -1463,6 +1617,10 @@ def render_cleanup_actions_markdown(actions: list[dict[str, Any]]) -> str:
         lines.append(f"- Confidence: `{action.get('confidence')}`")
         lines.append(f"- Risk: `{action.get('risk')}`")
         lines.append(f"- Automatic: `{str(action.get('automatic')).lower()}`")
+        if action.get("category_label"):
+            lines.append(f"- Category: `{action.get('category_label')}`")
+        if action.get("recommendation"):
+            lines.append(f"- Recommendation: `{action.get('recommendation')}`")
         commands = action.get("commands") or []
         if commands:
             lines.append("- Commands:")
@@ -1478,6 +1636,8 @@ def render_cleanup_actions_markdown(actions: list[dict[str, Any]]) -> str:
             lines.append("- Related paths:")
             for path in related_paths[:20]:
                 lines.append(f"  - `{path}`")
+        if action.get("cleanup_target_path"):
+            lines.append(f"- Cleanup target path: `{action.get('cleanup_target_path')}`")
         detected_kinds = action.get("detected_secret_kinds") or []
         if detected_kinds:
             lines.append("- Detected secret kinds:")

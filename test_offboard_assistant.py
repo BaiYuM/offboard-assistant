@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -161,6 +162,37 @@ class OffboardAssistantTests(unittest.TestCase):
             items = oa.scan_sensitive_locations([root])
             kinds = {finding["kind"] for finding in items[0]["secret_findings"]}
             self.assertIn("Anthropic API key", kinds)
+
+    def test_codex_tmp_plugin_path_is_recommended_cleanup(self):
+        item = {
+            "type": "sensitive_file_location",
+            "path": r"C:\Users\Lenovo\.codex\.tmp\plugins\plugin-a\config.json",
+            **oa.categorize_path(r"C:\Users\Lenovo\.codex\.tmp\plugins\plugin-a\config.json"),
+        }
+        self.assertEqual(item["category"], "codex_temp_plugin_cache")
+        self.assertEqual(item["recommendation"], "recommend_cleanup")
+        self.assertEqual(oa.recommended_cleanup_target(item), r"C:\Users\Lenovo\.codex\.tmp\plugins")
+
+    def test_ai_review_payload_excludes_secret_values(self):
+        secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+        items = [
+            {
+                "id": "1",
+                "type": "sensitive_file_location",
+                "path": r"C:\x\.env",
+                "secret_findings": [
+                    {
+                        "kind": "OpenAI API key",
+                        "masked": oa.mask_secret(secret),
+                        "fingerprint": oa.secret_fingerprint(secret),
+                        "value_recorded": False,
+                    }
+                ],
+            }
+        ]
+        payload = oa.ai_review_payload_for_items(items)
+        self.assertNotIn(secret, json.dumps(payload, ensure_ascii=False))
+        self.assertEqual(payload["items"][0]["secret_kinds"], ["OpenAI API key"])
 
 
 if __name__ == "__main__":

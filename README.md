@@ -175,6 +175,8 @@ python .\offboard_assistant.py scan --scan-root "$env:APPDATA\ccswitch"
 - 查看候选清理项：浏览器登录元数据、聊天数据目录、安装行为、环境变量、敏感文件位置。
 - 双击候选项进行勾选。
 - 导出选中清理动作清单，包含风险等级、人工步骤和可复制命令。
+- 导出 AI 审核包，内容只包含脱敏元数据，不包含密钥值、密码或聊天正文。
+- 隔离选中推荐项，把明确属于临时/缓存类的文件或目录移动到本地隔离区。
 - 标记选中项已处理。
 - 生成完整离职清理报告。
 - 配置 WebDAV 地址、用户名和远程文件名。
@@ -189,6 +191,27 @@ python .\offboard_assistant.py scan --scan-root "$env:APPDATA\ccswitch"
 - 不上传明文状态文件。
 - 不保存 WebDAV 密码或加密口令。
 - 勾选后默认导出清理清单或标记已处理，不做不可逆自动删除。
+
+### 导出清单、AI 审核和隔离
+
+`导出选中清理清单` 的含义：
+
+- 只生成 Markdown 清理建议。
+- 不删除文件。
+- 不修改浏览器密码、聊天数据或环境变量。
+
+`导出 AI 审核包` 的含义：
+
+- 生成 JSON 元数据，方便交给 AI 辅助归类和排序。
+- 不包含明文 API key、token、密码、Cookie 或聊天正文。
+- AI 只能辅助判断，最终删除仍应由用户确认。
+
+`隔离选中推荐项` 的含义：
+
+- 只处理 `recommend_cleanup` 类型，例如 Codex 临时插件缓存、临时目录。
+- 把文件/目录移动到 `%APPDATA%\OffboardAssistant\.offboard-assistant\quarantine\...`。
+- 不是永久删除，隔离区里会生成 `manifest.json` 记录原路径和新路径。
+- API key 文件、聊天目录、浏览器账号不会被这个按钮自动处理。
 
 ## 打包 EXE
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
+import shutil
 import subprocess
 import sys
 import tkinter as tk
@@ -63,6 +65,8 @@ class OffboardGui(tk.Tk):
         ttk.Button(toolbar, text="重新扫描", command=lambda: self.refresh_data(rescan=True)).pack(side="left", padx=(0, 6))
         ttk.Button(toolbar, text="生成报告", command=self.generate_report).pack(side="left", padx=(0, 6))
         ttk.Button(toolbar, text="导出选中清理清单", command=self.export_selected_plan).pack(side="left", padx=(0, 6))
+        ttk.Button(toolbar, text="导出 AI 审核包", command=self.export_ai_review_pack).pack(side="left", padx=(0, 6))
+        ttk.Button(toolbar, text="隔离选中推荐项", command=self.quarantine_selected_recommended).pack(side="left", padx=(0, 6))
         ttk.Button(toolbar, text="标记选中已处理", command=self.mark_selected_handled).pack(side="left", padx=(0, 6))
         ttk.Button(toolbar, text="打开状态目录", command=self.open_state_dir).pack(side="left")
 
@@ -180,7 +184,7 @@ class OffboardGui(tk.Tk):
             "推荐流程\n"
             "1. 入职时先运行 CLI 的 init 建立基线。\n"
             "2. 日常用 watch-install 低频监听安装行为。\n"
-            "3. 离职时在本窗口重新扫描，勾选候选项，导出清理清单。\n"
+            "3. 离职时在本窗口重新扫描，勾选候选项，导出清理清单或 AI 审核包。\n"
             "4. 加密导出后可上传到坚果云；家用电脑下载后导入继续查看。\n",
         )
         text.configure(state="disabled")
@@ -295,6 +299,77 @@ class OffboardGui(tk.Tk):
         actions = core.cleanup_actions_for_items(items)
         Path(path).write_text(core.render_cleanup_actions_markdown(actions), encoding="utf-8")
         self.set_status(f"选中清理清单已导出：{path}")
+
+    def export_ai_review_pack(self) -> None:
+        items = self.selected_items() or self.candidates
+        if not items:
+            messagebox.showinfo("没有候选项", "当前没有可导出的候选项。")
+            return
+        path = filedialog.asksaveasfilename(
+            title="保存 AI 审核包",
+            defaultextension=".json",
+            initialfile="ai-review-payload.json",
+            filetypes=[("JSON", "*.json")],
+        )
+        if not path:
+            return
+        payload = core.ai_review_payload_for_items(items)
+        Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.set_status(f"AI 审核包已导出：{path}")
+
+    def quarantine_selected_recommended(self) -> None:
+        items = self.selected_items()
+        if not items:
+            messagebox.showinfo("没有选中项", "请先双击候选项进行勾选。")
+            return
+        targets: dict[str, dict[str, Any]] = {}
+        skipped = 0
+        for item in items:
+            target = core.recommended_cleanup_target(item)
+            if not target:
+                skipped += 1
+                continue
+            targets[target] = item
+        if not targets:
+            messagebox.showinfo("没有可隔离项", "只有推荐清理的临时/缓存类项目支持直接隔离。API key、聊天目录、浏览器账号需要人工确认。")
+            return
+        message = (
+            f"将移动 {len(targets)} 个文件/目录到隔离区，跳过 {skipped} 个不适合自动处理的项目。\n\n"
+            "这不是永久删除，但会让原路径不可用。请先关闭相关程序。\n\n"
+            "是否继续？"
+        )
+        if not messagebox.askyesno("确认隔离", message):
+            return
+        manifest_rows: list[dict[str, Any]] = []
+        quarantine_root = self.state_dir / "quarantine" / dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        quarantine_root.mkdir(parents=True, exist_ok=True)
+        errors: list[str] = []
+        for index, (target_text, item) in enumerate(targets.items(), start=1):
+            source = Path(target_text)
+            if not source.exists():
+                errors.append(f"不存在：{source}")
+                continue
+            destination = quarantine_root / f"{index:03d}-{source.name}"
+            try:
+                shutil.move(str(source), str(destination))
+                manifest_rows.append(
+                    {
+                        "source": str(source),
+                        "destination": str(destination),
+                        "item_id": item.get("id"),
+                        "category": item.get("category"),
+                        "moved_at": core.utc_now(),
+                    }
+                )
+            except OSError as exc:
+                errors.append(f"{source}: {exc}")
+        manifest_path = quarantine_root / "manifest.json"
+        manifest_path.write_text(json.dumps({"items": manifest_rows, "errors": errors}, ensure_ascii=False, indent=2), encoding="utf-8")
+        if errors:
+            messagebox.showwarning("部分隔离失败", "\n".join(errors[:10]))
+        self.selected_ids.clear()
+        self.refresh_data(rescan=True)
+        self.set_status(f"已隔离 {len(manifest_rows)} 项到：{quarantine_root}")
 
     def mark_selected_handled(self) -> None:
         items = self.selected_items()
