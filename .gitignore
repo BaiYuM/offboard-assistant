@@ -16,6 +16,7 @@ venv/
 .env.*
 *.key
 *.pem
+config.json
 
 # Packaging output
 build/

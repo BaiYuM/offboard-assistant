@@ -13,6 +13,7 @@ import argparse
 import csv
 import datetime as dt
 import fnmatch
+import glob
 import hashlib
 import json
 import os
@@ -22,6 +23,7 @@ import shutil
 import sqlite3
 import sys
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -182,6 +184,393 @@ PATH_LIKE_ENV_NAMES = {
 }
 
 
+# Seed list of SaaS domains whose saved logins / configs in a work account
+# almost always belong to the company (rather than the user personally).
+# Local config can extend this via `personal_domains` / `company_email_domains`
+# in <state_dir>/config.json. Kept small on purpose — false positives are
+# worse than misses because the GUI exposes these as `[公司]/[个人]` labels.
+KNOWN_SAAS_DOMAINS: frozenset[str] = frozenset({
+    "github.com",
+    "gitlab.com",
+    "notion.so",
+    "slack.com",
+    "linear.app",
+    "figma.com",
+    "miro.com",
+    "asana.com",
+    "jira.atlassian.com",
+    "confluence.atlassian.com",
+})
+
+
+# Rules layer (Phase 2): replaces the hardcoded Python constants at
+# runtime. Built-ins stay as the bootstrap default; users can add to them
+# via ``<state_dir>/rules/overrides.yaml`` without editing source.
+RULES_DIR = Path(__file__).resolve().parent / "rules"
+DEFAULT_RULES_FILE = RULES_DIR / "default.yaml"
+USER_OVERRIDES_FILE = "rules/overrides.yaml"
+
+
+@dataclass(frozen=True)
+class RuleSet:
+    """A snapshot of path / SaaS / secret rules merged from builtins + overrides.
+
+    Treat instances as immutable; produce a fresh one via ``load_rules``.
+    """
+
+    path_rules: tuple[tuple[str, tuple[str, ...], str, str], ...]
+    saas_domains: frozenset[str]
+    secret_patterns: tuple[tuple[str, "re.Pattern[str]"], ...]
+    overrides_path: str | None
+
+    @property
+    def has_overrides(self) -> bool:
+        return self.overrides_path is not None
+
+
+def _load_yaml(path: Path) -> dict[str, Any] | None:
+    """Load YAML with PyYAML if installed, otherwise with a stdlib subset
+    parser. Returns None if the file is missing or malformed; the caller
+    decides what to do.
+    """
+    if not path.exists():
+        return None
+    # Preferred: PyYAML.
+    try:
+        import yaml  # type: ignore[import-untyped]
+    except ImportError:
+        yaml = None  # type: ignore[assignment]
+    if yaml is not None:
+        try:
+            with path.open(encoding="utf-8") as fh:
+                data = yaml.safe_load(fh)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        return data
+    # Fallback: minimal stdlib YAML parser that handles the schema used
+    # by ``rules/default.yaml`` and ``rules/overrides.yaml``: a top-level
+    # mapping whose values are either scalar lists or lists of mappings.
+    return _load_yaml_subset(path)
+
+
+def _load_yaml_subset(path: Path) -> dict[str, Any] | None:
+    """Tiny YAML parser for the Offboard rules schema. Supports:
+
+    - ``#`` comments to end of line
+    - top-level ``key: value`` mappings
+    - list entries under a key via ``  - item`` (scalars or ``- key: val``)
+    - scalar strings (no quotes required); commas, colons, and ``{`` in
+      scalars are tolerated by treating the rest of the line as the value
+
+    Anything more exotic (anchors, multi-line scalars, flow style) falls
+    through and returns ``None``, signalling the caller to fall back to
+    built-in constants. This is intentional: the file is hand-written, the
+    schema is fixed, and the tool never crashes on a feature it doesn't
+    understand.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+
+    result: dict[str, Any] = {}
+
+    def indent_of(raw: str) -> int:
+        return len(raw) - len(raw.lstrip(" "))
+
+    def strip_comment(raw: str) -> str:
+        return raw.split("#", 1)[0].rstrip()
+
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        line = strip_comment(raw)
+        if not line.strip():
+            i += 1
+            continue
+        if indent_of(line) != 0:
+            return None  # unexpected indent at top level
+        if ":" not in line:
+            return None
+        key, _ = line.split(":", 1)
+        key = key.strip()
+        i += 1
+        # Collect indented block under this key.
+        items: list[Any] = []
+        # Top-level list indent is expected at indent == 2 (e.g., "  - foo").
+        while i < len(lines):
+            raw = lines[i]
+            cur = strip_comment(raw)
+            if not cur.strip():
+                i += 1
+                continue
+            ind = indent_of(cur)
+            if ind == 0:
+                break  # next top-level key
+            if ind != 2:
+                return None
+            if not cur.lstrip().startswith("- "):
+                return None
+            item_text = cur.lstrip()[2:].strip()
+            if not item_text:
+                i += 1
+                continue
+            if ":" in item_text and not item_text.startswith(('"', "'")):
+                sub_key, _, sub_val = item_text.partition(":")
+                sub_map: dict[str, Any] = {sub_key.strip(): _coerce(sub_val.strip())}
+                i += 1
+                # Consume deeper-indented key: value pairs OR list entries
+                # belonging to this sub-mapping. The depth must be greater
+                # than the "- " position (>= 4 spaces). A "-" at this depth
+                # starts a list under the most recently-seen key.
+                current_key = sub_key.strip()
+                while i < len(lines):
+                    raw = lines[i]
+                    inner = strip_comment(raw)
+                    if not inner.strip():
+                        i += 1
+                        continue
+                    if indent_of(inner) <= 2:
+                        break
+                    stripped = inner.lstrip()
+                    if stripped.startswith("- "):
+                        # List entry under the most recent key.
+                        entry = stripped[2:].strip()
+                        existing = sub_map.get(current_key)
+                        if isinstance(existing, list):
+                            existing.append(_coerce(entry))
+                        else:
+                            sub_map[current_key] = [_coerce(entry)]
+                        i += 1
+                        continue
+                    if ":" not in inner:
+                        return None
+                    k2, _, v2 = inner.strip().partition(":")
+                    k2 = k2.strip()
+                    sub_map[k2] = _coerce(v2.strip())
+                    current_key = k2
+                    i += 1
+                items.append(sub_map)
+            else:
+                items.append(_coerce(item_text))
+                i += 1
+        result[key] = items
+    return result
+
+
+def _coerce(value: str) -> Any:
+    """Best-effort scalar coercion for the stdlib YAML subset.
+
+    Strips a single matching pair of surrounding ``"`` or ``'`` (a YAML
+    convention we follow in our hand-written files) and returns strings
+    as-is unless they look like an obvious number/boolean.
+    """
+    if not value:
+        return ""
+    lower = value.lower()
+    if lower == "true":
+        return True
+    if lower == "false":
+        return False
+    if lower in {"null", "~"}:
+        return None
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1]
+    return value
+
+
+def _materialize_default_rules() -> RuleSet:
+    """Read rules/default.yaml if available; otherwise fall back to the
+    hardcoded Python constants (so the tool still works without PyYAML).
+    """
+    yaml_data = _load_yaml(DEFAULT_RULES_FILE)
+    if yaml_data is None:
+        # Fallback path: PyYAML missing or default.yaml unreadable. Use
+        # the Python constants shipped with the module.
+        return RuleSet(
+            path_rules=tuple((cat, tuple(needles), label, rec) for cat, needles, label, rec in PATH_CATEGORY_RULES),
+            saas_domains=KNOWN_SAAS_DOMAINS,
+            secret_patterns=tuple((kind, pattern) for kind, pattern in SECRET_PROVIDER_PATTERNS),
+            overrides_path=None,
+        )
+
+    path_rules = yaml_data.get("path_rules") or []
+    materialized_path: list[tuple[str, tuple[str, ...], str, str]] = []
+    for entry in path_rules:
+        if not isinstance(entry, dict):
+            continue
+        cat = str(entry.get("category", "")).strip()
+        needles = entry.get("needles") or []
+        label = str(entry.get("label", cat)).strip()
+        rec = str(entry.get("recommendation", "review_required")).strip()
+        if not cat or not needles:
+            continue
+        materialized_path.append((cat, tuple(str(n) for n in needles), label, rec))
+
+    saas = yaml_data.get("saas_domains") or []
+    materialized_saas: set[str] = {str(d).lower() for d in saas if d}
+
+    patterns = yaml_data.get("secret_patterns") or []
+    materialized_patterns: list[tuple[str, re.Pattern[str]]] = []
+    for entry in patterns:
+        if not isinstance(entry, dict):
+            continue
+        kind = str(entry.get("kind", "")).strip()
+        pattern = str(entry.get("pattern", "")).strip()
+        if not kind or not pattern:
+            continue
+        try:
+            compiled = re.compile(pattern)
+        except re.error:
+            continue
+        materialized_patterns.append((kind, compiled))
+
+    return RuleSet(
+        path_rules=tuple(materialized_path),
+        saas_domains=frozenset(materialized_saas),
+        secret_patterns=tuple(materialized_patterns),
+        overrides_path=None,
+    )
+
+
+def load_rules(state_dir: Path | None = None) -> RuleSet:
+    """Load the merged rule set for a given state directory.
+
+    Merges the built-in defaults (from ``rules/default.yaml`` or the
+    Python constant fallback) with any user-supplied
+    ``<state_dir>/rules/overrides.yaml``. Override semantics:
+
+    - ``saas_domains``: **additive** — both sets unioned.
+    - ``path_rules``: per-category additive — same ``category`` key
+      extends needles; new categories appended after built-ins.
+    - ``secret_patterns``: **additive** — append override patterns
+      after built-ins.
+    """
+    base = _materialize_default_rules()
+    if state_dir is None:
+        return base
+    overrides_path = state_dir / USER_OVERRIDES_FILE
+    overrides = _load_yaml(overrides_path)
+    if overrides is None:
+        return RuleSet(
+            path_rules=base.path_rules,
+            saas_domains=base.saas_domains,
+            secret_patterns=base.secret_patterns,
+            overrides_path=None,
+        )
+
+    # Merge SaaS domains (additive).
+    merged_saas: set[str] = set(base.saas_domains)
+    for d in overrides.get("saas_domains") or []:
+        if isinstance(d, str) and d:
+            merged_saas.add(d.lower())
+
+    # Merge path rules (per-category additive).
+    rules_by_cat: dict[str, list[str]] = {}
+    ordered_cats: list[str] = []
+    rule_meta: dict[str, tuple[str, str]] = {}
+    for cat, needles, label, rec in base.path_rules:
+        rules_by_cat.setdefault(cat, []).extend(needles)
+        if cat not in ordered_cats:
+            ordered_cats.append(cat)
+        rule_meta[cat] = (label, rec)
+    for entry in overrides.get("path_rules") or []:
+        if not isinstance(entry, dict):
+            continue
+        cat = str(entry.get("category", "")).strip()
+        needles = entry.get("needles") or []
+        if not cat or not needles:
+            continue
+        rules_by_cat.setdefault(cat, []).extend(str(n) for n in needles)
+        if cat not in ordered_cats:
+            ordered_cats.append(cat)
+        # Override metadata wins for that category.
+        label = str(entry.get("label") or rule_meta.get(cat, (cat,))[0])
+        rec = str(entry.get("recommendation") or rule_meta.get(cat, (cat, "review_required"))[1])
+        rule_meta[cat] = (label, rec)
+    merged_path: list[tuple[str, tuple[str, ...], str, str]] = []
+    for cat in ordered_cats:
+        label, rec = rule_meta[cat]
+        merged_path.append((cat, tuple(rules_by_cat[cat]), label, rec))
+
+    # Merge secret patterns (additive, in order: builtins then overrides).
+    merged_patterns: list[tuple[str, re.Pattern[str]]] = list(base.secret_patterns)
+    for entry in overrides.get("secret_patterns") or []:
+        if not isinstance(entry, dict):
+            continue
+        kind = str(entry.get("kind", "")).strip()
+        pattern = str(entry.get("pattern", "")).strip()
+        if not kind or not pattern:
+            continue
+        try:
+            compiled = re.compile(pattern)
+        except re.error:
+            continue
+        merged_patterns.append((kind, compiled))
+
+    return RuleSet(
+        path_rules=tuple(merged_path),
+        saas_domains=frozenset(merged_saas),
+        secret_patterns=tuple(merged_patterns),
+        overrides_path=str(overrides_path),
+    )
+
+
+def infer_account_owner_hint(item: dict[str, Any], config: dict[str, Any] | None = None, state_dir: Path | None = None) -> str:
+    """Return `company_account`, `personal_account`, or `unknown` for an item.
+
+    Pure local substring matching against `origin` / `path` / `title` fields.
+    Never reads file contents, never makes a network call.
+
+    The SaaS domain seed list is loaded from ``rules/default.yaml`` (with
+    Python-constant fallback when PyYAML is missing) and merged with any
+    user overrides at ``<state_dir>/rules/overrides.yaml``.
+    """
+    cfg = config or {}
+    company_domains = [str(d).lower() for d in cfg.get("company_email_domains", []) if d]
+    personal_domains = [str(d).lower() for d in cfg.get("personal_email_domains", []) if d]
+
+    # Resolve the SaaS seed list from the rules layer so user overrides
+    # in <state_dir>/rules/overrides.yaml actually take effect.
+    rules = load_rules(state_dir)
+    saas_domains = set(rules.saas_domains)
+
+    haystacks: list[str] = []
+    for key in ("origin", "path", "title", "name", "app"):
+        value = item.get(key)
+        if isinstance(value, str) and value:
+            haystacks.append(value.lower())
+
+    # Explicit user config wins first.
+    for domain in company_domains:
+        if any(domain in h for h in haystacks):
+            return "company_account"
+    for domain in personal_domains:
+        if any(domain in h for h in haystacks):
+            return "personal_account"
+
+    # Personal tool paths in the user's home directory are usually personal.
+    for h in haystacks:
+        if any(
+            marker in h
+            for marker in (
+                "/.codex/", "/.claude/", "/.cursor/", "/.gemini/", "/.openai/",
+                "\\.codex\\", "\\.claude\\", "\\.cursor\\", "\\.gemini\\", "\\.openai\\",
+            )
+        ):
+            return "personal_account"
+
+    # SaaS origin / config path with no personal marker — assume company.
+    for h in haystacks:
+        for domain in saas_domains:
+            if domain in h:
+                return "company_account"
+
+    return "unknown"
+
+
 @dataclass(frozen=True)
 class BrowserProfile:
     browser: str
@@ -283,20 +672,23 @@ def normalize_path_for_match(path: str) -> str:
     return path.replace("/", "\\").lower()
 
 
-def categorize_path(path: str) -> dict[str, str]:
+def categorize_path(path: str, config: dict[str, Any] | None = None, state_dir: Path | None = None) -> dict[str, str]:
     slash_normalized = path.replace("\\", "/").lower()
-    for category, needles, label, recommendation in PATH_CATEGORY_RULES:
+    rules = load_rules(state_dir)
+    for category, needles, label, recommendation in rules.path_rules:
         for needle in needles:
             if needle.lower() in slash_normalized:
                 return {
                     "category": category,
                     "category_label": label,
                     "recommendation": recommendation,
+                    "account_owner_hint": infer_account_owner_hint({"path": path}, config),
                 }
     return {
         "category": "sensitive_file",
         "category_label": "敏感文件位置",
         "recommendation": "review_required",
+        "account_owner_hint": infer_account_owner_hint({"path": path}, config),
     }
 
 
@@ -328,7 +720,10 @@ def recommended_cleanup_target(item: dict[str, Any]) -> str | None:
     return path
 
 
-def ai_review_payload_for_items(items: list[dict[str, Any]]) -> dict[str, Any]:
+def ai_review_payload_for_items(
+    items: list[dict[str, Any]],
+    state_dir: Path | None = None,
+) -> dict[str, Any]:
     review_items: list[dict[str, Any]] = []
     for item in items:
         findings = item.get("secret_findings") or []
@@ -340,6 +735,7 @@ def ai_review_payload_for_items(items: list[dict[str, Any]]) -> dict[str, Any]:
                 "category": item.get("category"),
                 "category_label": item.get("category_label"),
                 "recommendation": item.get("recommendation"),
+                "account_owner_hint": item.get("account_owner_hint") or "unknown",
                 "path": item.get("path"),
                 "cleanup_target_path": recommended_cleanup_target(item),
                 "origin": item.get("origin"),
@@ -354,16 +750,38 @@ def ai_review_payload_for_items(items: list[dict[str, Any]]) -> dict[str, Any]:
                 "password_recorded": item.get("password_recorded", False),
             }
         )
-    return {
+    payload: dict[str, Any] = {
         "generated_at": utc_now(),
         "purpose": "AI review payload for cleanup recommendations. Contains metadata only, not secret values.",
         "safety_rules": [
             "Do not recommend deleting browser passwords or chat directories without explicit user confirmation.",
             "Recommend revoking or rotating API keys before local cleanup.",
             "Prefer quarantine/move-to-backup over permanent deletion.",
+            "Treat user-handled items as negative examples: do NOT re-select them.",
         ],
         "items": review_items,
     }
+    if state_dir is not None:
+        handled_path = state_dir / "handled-items.json"
+        if handled_path.exists():
+            try:
+                handled_raw = read_json(handled_path).get("items", [])
+            except (OSError, ValueError):
+                handled_raw = []
+            payload["user_feedback"] = {
+                # Whitelist: only {id, type, handled_at}. Drop title/path/origin
+                # so handled history never re-leaks identifiers into the AI.
+                "handled_items": [
+                    {
+                        "id": h.get("id"),
+                        "type": h.get("type"),
+                        "handled_at": h.get("handled_at"),
+                    }
+                    for h in handled_raw
+                    if h.get("id")
+                ]
+            }
+    return payload
 
 
 def ensure_state_dir(base: Path) -> Path:
@@ -379,14 +797,106 @@ def default_state_base() -> Path:
     return Path.home() / APP_NAME
 
 
-def state_dir_from_arg(value: str | None) -> Path:
+def portable_state_base() -> Path:
+    """Return the portable state base, used when ``--portable`` is set.
+
+    Layout: ``<exe parent>/.offboard_data``. When running from source
+    (not frozen) the parent falls back to cwd so the dev workflow still
+    works without an exe.
+    """
+    exe = getattr(sys, "executable", None)
+    if exe:
+        parent = Path(exe).resolve().parent
+    else:
+        parent = Path.cwd()
+    return parent / ".offboard_data"
+
+
+def state_dir_from_arg(value: str | None, portable: bool = False) -> Path:
     if value:
         return ensure_state_dir(Path(value))
-    base = default_state_base()
+    base = portable_state_base() if portable else default_state_base()
     base.mkdir(parents=True, exist_ok=True)
     state_dir = ensure_state_dir(base)
     migrate_legacy_state_if_needed(state_dir)
     return state_dir
+
+
+# Local-only config (NOT added to SYNC_FILES on purpose: company domain
+# rules are user-specific, never synced to cloud).
+CONFIG_FILE = "config.json"
+WIZARD_DONE_FILE = "wizard.done"
+DEFAULT_CONFIG: dict[str, Any] = {
+    "schema_version": 1,
+    "scan_roots": [],
+    "excluded_paths": [],
+    "company_email_domains": [],
+    "personal_email_domains": [],
+    "ide_scan_enabled": True,
+}
+
+
+def default_config() -> dict[str, Any]:
+    return json.loads(json.dumps(DEFAULT_CONFIG))
+
+
+def load_local_config(state_dir: Path) -> dict[str, Any]:
+    path = state_dir / CONFIG_FILE
+    if not path.exists():
+        return default_config()
+    try:
+        data = read_json(path)
+    except (OSError, ValueError):
+        return default_config()
+    merged = default_config()
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if key in merged and isinstance(value, type(merged[key])):
+                merged[key] = value
+    return merged
+
+
+def save_local_config(state_dir: Path, config: dict[str, Any]) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    write_json(state_dir / CONFIG_FILE, config)
+
+
+def is_wizard_done(state_dir: Path) -> bool:
+    return (state_dir / WIZARD_DONE_FILE).exists()
+
+
+def mark_wizard_done(state_dir: Path) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / WIZARD_DONE_FILE).write_text(
+        json.dumps({"completed_at": utc_now()}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def resolve_scan_roots(args_scan_roots: list[str] | None, config: dict[str, Any]) -> list[Path]:
+    """Merge scan-roots with precedence: CLI > config > builtin default."""
+    seen: set[str] = set()
+    result: list[Path] = []
+    for raw in args_scan_roots or []:
+        p = Path(raw).resolve()
+        key = str(p).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(p)
+    for raw in config.get("scan_roots") or []:
+        try:
+            p = Path(raw).resolve()
+        except (OSError, ValueError):
+            continue
+        key = str(p).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(p)
+    if not result:
+        return default_scan_roots()
+    return result
 
 
 def migrate_legacy_state_if_needed(target_state_dir: Path) -> list[str]:
@@ -1036,7 +1546,7 @@ def should_scan_file_contents(path: Path) -> bool:
     )
 
 
-def detect_secret_references(path: Path, max_bytes: int = 2 * 1024 * 1024) -> list[dict[str, Any]]:
+def detect_secret_references(path: Path, max_bytes: int = 2 * 1024 * 1024, state_dir: Path | None = None) -> list[dict[str, Any]]:
     try:
         stat = path.stat()
     except OSError:
@@ -1049,10 +1559,11 @@ def detect_secret_references(path: Path, max_bytes: int = 2 * 1024 * 1024) -> li
         return []
     findings: list[dict[str, Any]] = []
     seen: set[tuple[str, int, str]] = set()
+    rules = load_rules(state_dir)
     for line_no, line in enumerate(text.splitlines(), start=1):
         if len(line) > 20000:
             continue
-        for kind, pattern in SECRET_PROVIDER_PATTERNS:
+        for kind, pattern in rules.secret_patterns:
             for match in pattern.finditer(line):
                 secret = match.group(1) if match.lastindex else match.group(0)
                 key = (kind, line_no, secret_fingerprint(secret))
@@ -1071,7 +1582,7 @@ def detect_secret_references(path: Path, max_bytes: int = 2 * 1024 * 1024) -> li
     return findings
 
 
-def scan_sensitive_locations(roots: list[Path], max_files: int = 20000) -> list[dict[str, Any]]:
+def scan_sensitive_locations(roots: list[Path], max_files: int = 20000, state_dir: Path | None = None) -> list[dict[str, Any]]:
     found: list[dict[str, Any]] = []
     visited = 0
     ignored_dirs = {
@@ -1098,9 +1609,9 @@ def scan_sensitive_locations(roots: list[Path], max_files: int = 20000) -> list[
                 path = Path(dirpath) / filename
                 if not is_sensitive_name(path) and not should_scan_file_contents(path):
                     continue
-                secret_findings = detect_secret_references(path) if should_scan_file_contents(path) else []
+                secret_findings = detect_secret_references(path, state_dir=state_dir) if should_scan_file_contents(path) else []
                 path_text = safe_rel(path)
-                category = categorize_path(path_text)
+                category = categorize_path(path_text, state_dir=state_dir)
                 if secret_findings:
                     category = dict(category)
                     category["recommendation"] = "prioritize_revoke_then_clean"
@@ -1162,6 +1673,120 @@ def scan_chat_locations() -> list[dict[str, Any]]:
     return rows
 
 
+def scan_recent_ide_projects(custom_roots: list[Path] | None = None) -> list[dict[str, Any]]:
+    """Discover recently-opened IDE projects without reading any sensitive content.
+
+    Privacy boundary (per SECURITY.md):
+      - Parses ONLY JetBrains-family ``recentProjects.xml`` (plaintext XML).
+      - Never reads ``state.vscdb`` (VSCode/Cursor SQLite) — it can contain
+        cached extension tokens.
+      - Never reads ``workspaceStorage/<hash>/workspace.json`` ``settings``
+        subtree — it can contain ``sentry.dsn`` and other token references.
+      - Never reads ``argv.json`` — it can contain full local install paths.
+      - Never reads any file content beyond XML element text.
+    """
+    roots: list[Path] = []
+    if custom_roots:
+        roots.extend(custom_roots)
+    else:
+        # Platform-specific discovery. Each block is best-effort: missing
+        # directories simply yield no matches, never an error.
+        if sys.platform.startswith("win"):
+            appdata = os.environ.get("APPDATA")
+            if appdata:
+                roots.append(Path(appdata) / "JetBrains")
+            local_appdata = os.environ.get("LOCALAPPDATA")
+            if local_appdata:
+                roots.append(Path(local_appdata) / "JetBrains")
+        elif sys.platform == "darwin":
+            # macOS: ~/Library/Application Support/JetBrains
+            roots.append(Path.home() / "Library" / "Application Support" / "JetBrains")
+        else:
+            # Linux / other Unix: respect XDG_CONFIG_HOME, then ~/.config
+            xdg = os.environ.get("XDG_CONFIG_HOME")
+            if xdg:
+                roots.append(Path(xdg) / "JetBrains")
+            roots.append(Path.home() / ".config" / "JetBrains")
+
+    if not roots:
+        return []
+
+    rows: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for root in roots:
+        if not root.exists():
+            continue
+        for xml_path in glob.glob(str(root / "*" / "options" / "recentProjects.xml")):
+            ide_name = Path(xml_path).parent.parent.name
+            try:
+                tree = ET.parse(xml_path)
+            except (ET.ParseError, OSError, ValueError):
+                # Schema drift between JetBrains versions; skip silently.
+                continue
+            try:
+                for entry in tree.getroot().findall(".//entry"):
+                    path = entry.get("key") or entry.get("path")
+                    if not path:
+                        continue
+                    meta = entry.find("value/RecentProjectMetaInfo")
+                    project_name: str | None = None
+                    last_opened_raw: str | None = None
+                    if meta is not None:
+                        for opt in meta.findall("option"):
+                            oname = opt.get("name")
+                            if oname == "projectName":
+                                project_name = opt.get("value")
+                            elif oname == "lastOpened":
+                                last_opened_raw = opt.get("value")
+                    display_name = project_name or Path(path).name or "unknown"
+                    last_opened_iso = _jetbrains_time_to_iso(last_opened_raw)
+                    item_id = stable_id(["ide-recent", ide_name, path])
+                    if item_id in seen_ids:
+                        continue
+                    seen_ids.add(item_id)
+                    rows.append(
+                        {
+                            "id": item_id,
+                            "type": "ide_recent_project",
+                            "ide": ide_name,
+                            "path": path,
+                            "name": display_name,
+                            "last_opened_at": last_opened_iso,
+                            "category": "ide_recent_project",
+                            "category_label": "IDE 最近项目",
+                            "recommendation": "review_required",
+                            "account_owner_hint": infer_account_owner_hint(
+                                {"path": path, "name": display_name, "ide": ide_name}
+                            ),
+                            "contents_recorded": False,
+                            "value_recorded": False,
+                            "modified_at": last_opened_iso,
+                        }
+                    )
+            finally:
+                # Release the parsed tree as early as possible so the on-disk
+                # XML payload is not retained in memory longer than needed.
+                del tree
+    return rows
+
+
+def _jetbrains_time_to_iso(value: str | None) -> str | None:
+    """Convert JetBrains ``lastOpened`` (epoch millis or ISO) to ISO 8601 UTC."""
+    if not value:
+        return None
+    try:
+        millis = int(value)
+        if millis > 10**12:  # treat as milliseconds
+            return dt.datetime.fromtimestamp(millis / 1000.0, tz=dt.timezone.utc).isoformat()
+        return dt.datetime.fromtimestamp(millis, tz=dt.timezone.utc).isoformat()
+    except (ValueError, TypeError):
+        pass
+    try:
+        return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(dt.timezone.utc).isoformat()
+    except ValueError:
+        return None
+
+
 def collect_snapshot(state_dir: Path, roots: list[Path]) -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -1175,13 +1800,15 @@ def collect_snapshot(state_dir: Path, roots: list[Path]) -> dict[str, Any]:
             "passwords_recorded": False,
             "secret_values_recorded": False,
             "chat_contents_recorded": False,
+            "ide_recent_project_contents_recorded": False,
         },
         "items": (
             scan_environment()
             + scan_installed_apps_from_registry()
             + scan_browser_logins(state_dir)
-            + scan_sensitive_locations(roots)
+            + scan_sensitive_locations(roots, state_dir=state_dir)
             + scan_chat_locations()
+            + scan_recent_ide_projects()
         ),
     }
 
@@ -1194,6 +1821,7 @@ def item_times(item: dict[str, Any]) -> list[dt.datetime]:
         "password_modified_at",
         "modified_at",
         "last_used_at",
+        "last_opened_at",
         "generated_at",
         "detected_at",
     ):
@@ -1350,8 +1978,9 @@ def render_report(since: dt.datetime, snapshot: dict[str, Any], candidates: list
 
 
 def command_init(args: argparse.Namespace) -> int:
-    state_dir = state_dir_from_arg(args.state_dir)
-    roots = [Path(path) for path in args.scan_root] if args.scan_root else default_scan_roots()
+    state_dir = state_dir_from_arg(args.state_dir, portable=bool(getattr(args, "portable", False)))
+    config = _load_config_for_args(args, state_dir)
+    roots = resolve_scan_roots(args.scan_root, config)
     snapshot = collect_snapshot(state_dir, roots)
     baseline_path = state_dir / BASELINE_FILE
     if baseline_path.exists() and not args.force:
@@ -1367,8 +1996,9 @@ def command_init(args: argparse.Namespace) -> int:
 
 
 def command_scan(args: argparse.Namespace) -> int:
-    state_dir = state_dir_from_arg(args.state_dir)
-    roots = [Path(path) for path in args.scan_root] if args.scan_root else default_scan_roots()
+    state_dir = state_dir_from_arg(args.state_dir, portable=bool(getattr(args, "portable", False)))
+    config = _load_config_for_args(args, state_dir)
+    roots = resolve_scan_roots(args.scan_root, config)
     snapshot = collect_snapshot(state_dir, roots)
     snapshot_path = state_dir / SNAPSHOT_FILE
     write_json(snapshot_path, snapshot)
@@ -1379,15 +2009,16 @@ def command_scan(args: argparse.Namespace) -> int:
 
 
 def command_report(args: argparse.Namespace) -> int:
-    state_dir = state_dir_from_arg(args.state_dir)
+    state_dir = state_dir_from_arg(args.state_dir, portable=bool(getattr(args, "portable", False)))
     baseline_path = state_dir / BASELINE_FILE
     if not baseline_path.exists():
         print(f"Missing baseline: {baseline_path}", file=sys.stderr)
         print("Run init first.", file=sys.stderr)
         return 2
     baseline = read_json(baseline_path)
+    config = _load_config_for_args(args, state_dir)
+    roots = resolve_scan_roots(args.scan_root, config)
     if args.rescan:
-        roots = [Path(path) for path in args.scan_root] if args.scan_root else default_scan_roots()
         snapshot = collect_snapshot(state_dir, roots)
         write_json(state_dir / SNAPSHOT_FILE, snapshot)
     else:
@@ -1395,7 +2026,6 @@ def command_report(args: argparse.Namespace) -> int:
         if snapshot_path.exists():
             snapshot = read_json(snapshot_path)
         else:
-            roots = [Path(path) for path in args.scan_root] if args.scan_root else default_scan_roots()
             snapshot = collect_snapshot(state_dir, roots)
             write_json(snapshot_path, snapshot)
 
@@ -1419,14 +2049,14 @@ def command_report(args: argparse.Namespace) -> int:
     return 0
 
 
-def load_candidates_for_state(state_dir: Path, since_override: str | None, rescan: bool, scan_roots: list[str]) -> tuple[dict[str, Any], list[dict[str, Any]], dt.datetime]:
+def load_candidates_for_state(state_dir: Path, since_override: str | None, rescan: bool, scan_roots: list[str], config: dict[str, Any] | None = None) -> tuple[dict[str, Any], list[dict[str, Any]], dt.datetime]:
     baseline_path = state_dir / BASELINE_FILE
     if not baseline_path.exists():
         raise FileNotFoundError(f"Missing baseline: {baseline_path}")
     baseline = read_json(baseline_path)
     snapshot_path = state_dir / SNAPSHOT_FILE
     if rescan or not snapshot_path.exists():
-        roots = [Path(path) for path in scan_roots] if scan_roots else default_scan_roots()
+        roots = resolve_scan_roots(scan_roots, config or {})
         snapshot = collect_snapshot(state_dir, roots)
         write_json(snapshot_path, snapshot)
     else:
@@ -1442,10 +2072,35 @@ def load_candidates_for_state(state_dir: Path, since_override: str | None, resca
     return snapshot, candidates, since
 
 
+def command_list_rules(args: argparse.Namespace) -> int:
+    """Print the merged rule set. With ``--overrides-path``, also show
+    the path the loader is reading from (or "no overrides")."""
+    state_dir = state_dir_from_arg(args.state_dir, portable=bool(getattr(args, "portable", False)))
+    rules = load_rules(state_dir)
+    print("Path rules:")
+    for cat, needles, label, rec in rules.path_rules:
+        needle_list = ", ".join(needles)
+        print(f"  - {cat} ({rec}): {needle_list}")
+    print("")
+    print("SaaS domains:")
+    for domain in sorted(rules.saas_domains):
+        print(f"  - {domain}")
+    print("")
+    print("Secret patterns:")
+    for kind, _pattern in rules.secret_patterns:
+        print(f"  - {kind}")
+    if args.overrides_path:
+        path = state_dir / USER_OVERRIDES_FILE
+        print("")
+        print(f"Overrides: {path if path.exists() else '(no overrides)'}")
+    return 0
+
+
 def command_actions(args: argparse.Namespace) -> int:
-    state_dir = state_dir_from_arg(args.state_dir)
+    state_dir = state_dir_from_arg(args.state_dir, portable=bool(getattr(args, "portable", False)))
     try:
-        _snapshot, candidates, _since = load_candidates_for_state(state_dir, args.since, args.rescan, args.scan_root)
+        config = _load_config_for_args(args, state_dir)
+        _snapshot, candidates, _since = load_candidates_for_state(state_dir, args.since, args.rescan, args.scan_root, config)
     except FileNotFoundError as exc:
         print(str(exc), file=sys.stderr)
         print("Run init first.", file=sys.stderr)
@@ -1459,6 +2114,253 @@ def command_actions(args: argparse.Namespace) -> int:
     print(f"Cleanup actions written: {output_path}")
     print(f"Actions: {len(actions)}")
     return 0
+
+
+def list_quarantine_bundles(state_dir: Path) -> list[dict[str, Any]]:
+    quarantine_root = state_dir / "quarantine"
+    if not quarantine_root.exists():
+        return []
+    bundles: list[dict[str, Any]] = []
+    for child in sorted(quarantine_root.iterdir(), reverse=True):
+        manifest_path = child / "manifest.json"
+        if not manifest_path.is_file():
+            continue
+        try:
+            data = read_json(manifest_path)
+        except (OSError, ValueError):
+            bundles.append({"directory": str(child), "ts": child.name, "items": [], "errors": ["manifest_unreadable"]})
+            continue
+        bundles.append(
+            {
+                "directory": str(child),
+                "ts": child.name,
+                "items": data.get("items", []),
+                "errors": data.get("errors", []),
+            }
+        )
+    return bundles
+
+
+QUARANTINE_INDEX_FILE = "quarantine-index.sqlite"
+
+
+def _quarantine_index_path(state_dir: Path) -> Path:
+    return state_dir / QUARANTINE_INDEX_FILE
+
+
+def _ensure_quarantine_index(state_dir: Path) -> "sqlite3.Connection | None":
+    """Open the quarantine SQLite index, creating schema if missing.
+
+    Returns None on filesystem error so callers can degrade to manifest.json
+    reads without the index (it is an accelerator, never the source of truth).
+    """
+    try:
+        path = _quarantine_index_path(state_dir)
+        conn = sqlite3.connect(str(path))
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS batches (
+                batch_id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                source_count INTEGER NOT NULL DEFAULT 0,
+                source_bytes INTEGER NOT NULL DEFAULT 0,
+                tags TEXT NOT NULL DEFAULT '',
+                restored_count INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS items (
+                batch_id TEXT NOT NULL,
+                item_id TEXT,
+                source TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                category TEXT,
+                moved_at TEXT NOT NULL,
+                FOREIGN KEY (batch_id) REFERENCES batches(batch_id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_items_batch ON items(batch_id)"
+        )
+        conn.commit()
+        return conn
+    except sqlite3.Error:
+        return None
+
+
+def _index_quarantine_batch(state_dir: Path, batch_dir: Path, manifest: dict[str, Any]) -> None:
+    """Mirror a freshly written manifest into the SQLite index.
+
+    Best-effort: errors are swallowed because the index is an accelerator,
+    not the source of truth. The manifest.json still drives restore.
+    """
+    conn = _ensure_quarantine_index(state_dir)
+    if conn is None:
+        return
+    try:
+        batch_id = batch_dir.name
+        items = manifest.get("items", []) or []
+        source_bytes = 0
+        for row in items:
+            try:
+                source_bytes += Path(row.get("source", "")).stat().st_size if row.get("source") and Path(row.get("source", "")).exists() else 0
+            except OSError:
+                pass
+        tags = ""
+        conn.execute(
+            "INSERT OR REPLACE INTO batches (batch_id, created_at, source_count, source_bytes, tags, restored_count) VALUES (?, ?, ?, ?, ?, 0)",
+            (
+                batch_id,
+                utc_now(),
+                len(items),
+                source_bytes,
+                tags,
+            ),
+        )
+        # Replace any existing items for this batch (idempotent re-index).
+        conn.execute("DELETE FROM items WHERE batch_id = ?", (batch_id,))
+        for row in items:
+            conn.execute(
+                "INSERT INTO items (batch_id, item_id, source, destination, category, moved_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    batch_id,
+                    str(row.get("item_id") or ""),
+                    str(row.get("source") or ""),
+                    str(row.get("destination") or ""),
+                    str(row.get("category") or ""),
+                    str(row.get("moved_at") or ""),
+                ),
+            )
+        conn.commit()
+    except sqlite3.Error:
+        pass
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+
+
+def query_quarantine_index(state_dir: Path, limit: int = 100) -> list[dict[str, Any]]:
+    """Return recent batches from the SQLite index. Fast (O(1)) unlike the
+    manifest.json scan path. Empty list when the index does not exist yet.
+    """
+    conn = _ensure_quarantine_index(state_dir)
+    if conn is None:
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT batch_id, created_at, source_count, source_bytes, tags, restored_count "
+            "FROM batches ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [
+            {
+                "batch_id": r[0],
+                "created_at": r[1],
+                "source_count": r[2],
+                "source_bytes": r[3],
+                "tags": r[4],
+                "restored_count": r[5],
+            }
+            for r in rows
+        ]
+    except sqlite3.Error:
+        return []
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+
+
+def _bump_quarantine_index_restored(state_dir: Path, batch_id: str, restored_count: int) -> None:
+    """Update the index after a restore. Silent on failure."""
+    conn = _ensure_quarantine_index(state_dir)
+    if conn is None:
+        return
+    try:
+        conn.execute(
+            "UPDATE batches SET restored_count = ? WHERE batch_id = ?",
+            (restored_count, batch_id),
+        )
+        conn.commit()
+    except sqlite3.Error:
+        pass
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+
+
+def restore_quarantine_dir(quarantine_dir: Path) -> dict[str, Any]:
+    """Reverse `quarantine_selected_recommended` by reading manifest.json and
+    moving each entry back to its original path. Skips (does not overwrite)
+    destinations that already exist; reports both groups.
+    """
+    manifest_path = quarantine_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Missing manifest: {manifest_path}")
+    manifest = read_json(manifest_path)
+    result: dict[str, Any] = {"restored": [], "skipped": [], "errors": []}
+    for row in manifest.get("items", []):
+        destination = Path(row.get("destination", ""))
+        source = Path(row.get("source", ""))
+        if not source or not destination:
+            result["errors"].append(f"manifest row missing paths: {row}")
+            continue
+        if not destination.exists():
+            result["errors"].append(f"quarantined file missing: {destination}")
+            continue
+        if source.exists():
+            result["skipped"].append(str(source))
+            continue
+        try:
+            source.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(destination), str(source))
+            result["restored"].append(str(source))
+        except OSError as exc:
+            result["errors"].append(f"{source}: {exc}")
+    if result["restored"]:
+        # Derive state_dir from the path layout: <state_dir>/quarantine/<ts>.
+        # Skip silently if the layout doesn't match (e.g. ad-hoc restore).
+        if quarantine_dir.parent.name == "quarantine":
+            state_dir = quarantine_dir.parent.parent
+            _bump_quarantine_index_restored(state_dir, quarantine_dir.name, len(result["restored"]))
+    return result
+
+
+def purge_quarantine_dir(quarantine_dir: Path) -> dict[str, Any]:
+    """Permanently delete a quarantine bundle (the moved files plus its manifest)."""
+    if not quarantine_dir.exists():
+        return {"purged": False, "errors": [f"not found: {quarantine_dir}"]}
+    try:
+        shutil.rmtree(quarantine_dir)
+        return {"purged": True, "errors": []}
+    except OSError as exc:
+        return {"purged": False, "errors": [str(exc)]}
+
+
+def command_restore_quarantine(args: argparse.Namespace) -> int:
+    quarantine_dir = Path(args.quarantine_dir)
+    if not quarantine_dir.exists():
+        print(f"Quarantine dir not found: {quarantine_dir}", file=sys.stderr)
+        return 2
+    result = restore_quarantine_dir(quarantine_dir)
+    print(f"Restored: {len(result['restored'])}")
+    print(f"Skipped (source already exists): {len(result['skipped'])}")
+    print(f"Errors: {len(result['errors'])}")
+    for path in result["restored"]:
+        print(f"  restored: {path}")
+    for path in result["skipped"]:
+        print(f"  skipped:  {path}")
+    for err in result["errors"]:
+        print(f"  error:    {err}", file=sys.stderr)
+    return 0 if not result["errors"] else 1
 
 
 def install_events_since(path: Path, since: dt.datetime) -> list[dict[str, Any]]:
@@ -1492,6 +2394,7 @@ def cleanup_action_for_item(item: dict[str, Any]) -> dict[str, Any]:
         "automatic": False,
         "commands": [],
         "manual_steps": [],
+        "account_owner_hint": item.get("account_owner_hint") or "unknown",
     }
 
     if item_type == "environment_variable":
@@ -1603,6 +2506,11 @@ def cleanup_action_for_item(item: dict[str, Any]) -> dict[str, Any]:
             "Confirm whether chat history belongs to a company account or personal account.",
             "Do not delete the data directory directly unless the app is closed and you have confirmed the account scope.",
         ]
+        owner_hint = str(item.get("account_owner_hint") or "unknown")
+        if owner_hint == "company_account":
+            action["manual_steps"].insert(0, "Account ownership: company. Follow company handover/archival procedure, log out, then clear cache.")
+        elif owner_hint == "personal_account":
+            action["manual_steps"].insert(0, "Account ownership: personal. Encrypt and back up to your personal cloud first, then clean local residue.")
         return action
 
     if item_type == "installed_app":
@@ -1625,6 +2533,22 @@ def cleanup_action_for_item(item: dict[str, Any]) -> dict[str, Any]:
             "Check detected install paths for config files that may contain work credentials.",
         ]
         action["related_paths"] = paths
+        return action
+
+    if item_type == "ide_recent_project":
+        ide = item.get("ide") or "IDE"
+        project_name = item.get("name") or "unknown project"
+        project_path = item.get("path") or ""
+        action["title"] = f"{ide}: {project_name}"
+        action["risk"] = "review_required"
+        action["manual_steps"] = [
+            f"Open {ide} and decide whether the project `{project_name}` is work-related.",
+            "If it belongs to the company, hand the project over or move it into the company code repository before leaving.",
+            "If it is personal, leave it on your own device; do not copy company source code into personal storage.",
+            "Close the project in the IDE and clear the recent-projects list only after confirming the project location.",
+        ]
+        if project_path:
+            action["related_paths"] = [project_path]
         return action
 
     action["manual_steps"] = ["Review this item manually before taking action."]
@@ -1657,6 +2581,8 @@ def render_cleanup_actions_markdown(actions: list[dict[str, Any]]) -> str:
             lines.append(f"- Category: `{action.get('category_label')}`")
         if action.get("recommendation"):
             lines.append(f"- Recommendation: `{action.get('recommendation')}`")
+        if action.get("account_owner_hint"):
+            lines.append(f"- Account owner hint: `{action.get('account_owner_hint')}`")
         commands = action.get("commands") or []
         if commands:
             lines.append("- Commands:")
@@ -1691,7 +2617,7 @@ def render_cleanup_actions_markdown(actions: list[dict[str, Any]]) -> str:
 
 
 def command_watch_install(args: argparse.Namespace) -> int:
-    state_dir = state_dir_from_arg(args.state_dir)
+    state_dir = state_dir_from_arg(args.state_dir, portable=bool(getattr(args, "portable", False)))
     state_path = state_dir / INSTALL_MONITOR_STATE_FILE
     events_path = state_dir / INSTALL_EVENTS_FILE
     watch_dirs = [Path(path) for path in args.watch_dir] if args.watch_dir else default_install_watch_dirs()
@@ -1731,6 +2657,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--state-dir",
         help="Directory that contains the .offboard-assistant state folder. Default: %%APPDATA%%\\OffboardAssistant.",
+    )
+    parser.add_argument(
+        "--config",
+        help="Path to local config.json. Defaults to <state-dir>/config.json. Never synced to cloud.",
+    )
+    parser.add_argument(
+        "--portable",
+        action="store_true",
+        help="Store state next to the running executable (in .offboard_data/). "
+             "Useful for running from a USB stick or a sandboxed folder; "
+             "no APPDATA writes.",
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
 
@@ -1778,7 +2715,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of polling iterations before exit. Omit to keep running.",
     )
     watch_parser.set_defaults(func=command_watch_install)
+
+    restore_parser = subcommands.add_parser(
+        "restore-quarantine",
+        help="Restore files from a previous quarantine batch back to their original paths.",
+    )
+    restore_parser.add_argument(
+        "--quarantine-dir",
+        required=True,
+        help="Path to a <state-dir>/quarantine/<timestamp>/ directory produced by the GUI.",
+    )
+    restore_parser.set_defaults(func=command_restore_quarantine)
+
+    list_rules_parser = subcommands.add_parser(
+        "list-rules",
+        help="Print the currently active path / SaaS / secret rules.",
+    )
+    list_rules_parser.set_defaults(func=command_list_rules)
     return parser
+
+
+def _load_config_for_args(args: argparse.Namespace, state_dir: Path) -> dict[str, Any]:
+    config_path = Path(args.config) if getattr(args, "config", None) else state_dir / CONFIG_FILE
+    if not config_path.is_absolute() and config_path.parent == Path("."):
+        # Caller passed a relative bare filename — treat as under state_dir.
+        config_path = state_dir / config_path
+    if config_path == state_dir / CONFIG_FILE:
+        return load_local_config(state_dir)
+    try:
+        data = read_json(config_path)
+    except (OSError, ValueError):
+        return default_config()
+    merged = default_config()
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if key in merged and isinstance(value, type(merged[key])):
+                merged[key] = value
+    return merged
 
 
 def main(argv: list[str] | None = None) -> int:

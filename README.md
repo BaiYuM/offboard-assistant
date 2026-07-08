@@ -241,6 +241,57 @@ AI 勾选策略：
 - 不是永久删除，隔离区里会生成 `manifest.json` 记录原路径和新路径。
 - API key 文件、聊天目录、浏览器账号不会被这个按钮自动处理。
 
+### 隔离历史与还原
+
+`更多操作 ▾` → `查看隔离历史` 打开一个时间倒序列出所有隔离批次。
+每条记录来自 `<state-dir>/quarantine/<timestamp>/manifest.json`，可执行：
+
+- **还原**：反向 `shutil.move` 把文件移回原路径。如果原路径已有同名文件，**跳过**而不是覆盖。
+- **永久删除**：递归 `rmtree` 整个批次（不可恢复）。
+
+CLI 等价物：
+
+```powershell
+python .\offboard_assistant.py restore-quarantine --quarantine-dir .\.offboard-assistant\quarantine\20260708-153012
+```
+
+### 首次运行向导 + 本地配置
+
+首次启动（既无基线也无 `wizard.done`）会弹出三步向导：
+基线日期 → 公司/个人邮箱域名 → 扫描目录。完成后写入
+`<state-dir>/config.json` + `wizard.done` 标记。`config.json` **只在本地**，不会进入云同步包。
+
+CLI 可用 `--config <path>` 覆盖配置位置，或在配置里预填
+`company_email_domains` / `personal_email_domains` 让
+`account_owner_hint` 推断更准。
+
+### IDE 最近项目维度
+
+扫描 JetBrains 系列 IDE（IntelliJ / PyCharm / GoLand 等）的
+`%APPDATA%\JetBrains\<IDE>\options\recentProjects.xml`，
+把最近打开过的项目加进清理清单。**不读** `.vscdb`、**不读**
+`workspaceStorage/<hash>/workspace.json` 的 `settings` 子树、**不读**
+`argv.json`——只取路径 + 项目名 + 最后打开时间。
+
+### 账户归属建议
+
+每条候选会带 `account_owner_hint`（`company_account` /
+`personal_account` / `unknown`），GUI 在行首显示 `[公司]/[个人]/[未知]`
+前缀，详情面板单独列出。规则来源：路径关键字 + 内置 SaaS 域名种子
++ 用户在 `config.json` 里填的公司/个人邮箱域名。详见
+`offboard_assistant.py` 的 `KNOWN_SAAS_DOMAINS` 与
+`infer_account_owner_hint()`。
+
+### 状态条分级
+
+窗口底部状态条按严重度显示不同颜色圆点 + 文字背景：
+`info` 绿、 `warn` 黄、 `error` 红、 `busy` 灰。`messagebox` 弹窗
+保持原样（必须保留模态确认）。
+
+## 更新记录
+
+完整改动历史见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 打包 EXE
 
 安装打包依赖并生成窗口版 EXE：
@@ -337,3 +388,63 @@ CI 会在 Windows 上运行单元测试和编译检查。手动触发 `build-win
 2. 再清理公司域名相关浏览器保存密码和站点数据。
 3. 对个人账号、入职前已有账号、银行/社交/购物等账号一律保留或人工确认。
 4. 聊天软件只根据目录位置清理缓存或退出账号，不读取聊天正文。
+
+## 自定义规则
+
+工具使用三组规则来识别"该清理什么"：
+
+- **path rules**：7 类内置规则（codex 临时缓存、AI 工具配置、SSH 配置等），决定如何分类敏感文件位置
+- **SaaS domains**：10 个内置种子（github.com / gitlab.com / slack.com / notion.so 等），用来推断账户归属
+- **secret patterns**：8 个内置正则（OpenAI、Anthropic、GitHub、AWS、Google、Slack、Generic bearer、Generic assignment），决定从 .env / .npmrc / .pypirc 等文件里识别什么
+
+### 加性合并
+
+不动源码也能扩展：在 `<state_dir>/rules/overrides.yaml` 写你自己的规则：
+
+- **saas_domains**（加性 union）：你列的域名会**追加**到内置集。内置集永不被裁剪。
+- **path_rules**（按 category 加性）：同 category 追加 needles；新 category 追加在末尾。
+- **secret_patterns**（加性）：你的正则追加在内置之后。
+
+合并后所有调用方（`infer_account_owner_hint` / `categorize_path` / `detect_secret_references`）都自动看到新规则。
+
+### 例子：公司内网域名
+
+公司内网用 `jira.acme.internal` 协作，写：
+
+```yaml
+# %APPDATA%\OffboardAssistant\.offboard-assistant\rules\overrides.yaml
+# （macOS / Linux 路径见下）
+saas_domains:
+  - jira.acme.internal
+  - gitlab.acme.internal
+
+path_rules:
+  - category: company_dev_paths
+    needles:
+      - "/work/acme/"
+    label: "公司项目路径"
+    recommendation: "review_required"
+```
+
+例子文件名：
+- Windows: `%APPDATA%\OffboardAssistant\.offboard-assistant\rules\overrides.yaml`
+- macOS: `~/Library/Application Support/OffboardAssistant/.offboard-assistant/rules/overrides.yaml`
+- Linux: `~/.config/OffboardAssistant/.offboard-assistant/rules/overrides.yaml`
+
+### 查看当前规则
+
+CLI：
+
+```powershell
+python .\offboard_assistant.py list-rules
+```
+
+GUI：**清理清单 → 当前规则** 标签页，Reload 按钮重新读取 overrides.yaml。
+
+### 隐私保护
+
+`config.json` 和 `overrides.yaml` **都不会**进入加密同步包（不在 `sync_bundle.SYNC_FILES` allowlist 里）。规则是本地用户视角，不会上云。
+
+### 0 依赖
+
+整套 YAML 解析器用 stdlib 实现，**不引 PyYAML**。支持 `# 注释`、嵌套 mapping、sequence、单/双引号字符串。

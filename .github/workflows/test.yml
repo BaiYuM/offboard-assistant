@@ -18,4 +18,19 @@ jobs:
         run: python -m unittest
       - name: Compile check
         run: python -m py_compile offboard_assistant.py offboard_gui.py sync_bundle.py
+      - name: CHANGELOG sanity
+        run: |
+          python -c "
+          from pathlib import Path
+          p = Path('CHANGELOG.md')
+          if not p.exists():
+              print('::warning::CHANGELOG.md is missing')
+          else:
+              text = p.read_text(encoding='utf-8')
+              for marker in ('## Phase', 'Added', 'Tests', 'Hard rules preserved'):
+                  if marker not in text:
+                      print(f'::error::CHANGELOG.md missing marker: {marker}')
+                      raise SystemExit(1)
+              print('CHANGELOG.md OK')
+          "
 

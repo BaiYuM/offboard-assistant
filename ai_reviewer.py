@@ -19,11 +19,19 @@ Your job:
 - Prefer temporary/cache items and obvious post-baseline work residue.
 - For API key files, recommend revoke/rotate first, then local cleanup.
 - Do not recommend automatic deletion for browser passwords, chat directories, SSH keys, cloud credentials, or ambiguous personal data.
+- Treat user-handled items (in the "Handled items" section) as negative examples: do NOT recommend action="select" for them. You may still emit action="review" for similar new patterns.
 - Return strict JSON only.
 """
 
 
 def build_user_prompt(payload: dict[str, Any]) -> str:
+    handled = (payload.get("user_feedback") or {}).get("handled_items") or []
+    handled_block = ""
+    if handled:
+        handled_block = (
+            "\n\nHandled items (do NOT re-select; treat as negative examples):\n"
+            + json.dumps(handled, ensure_ascii=False, indent=2)
+        )
     return (
         "Review this offboarding cleanup metadata and return JSON with this schema:\n"
         "{\n"
@@ -39,10 +47,43 @@ def build_user_prompt(payload: dict[str, Any]) -> str:
         "- For recommend_cleanup cache/temp items, action can be select with low/medium risk.\n"
         "- For secrets, action can be select, but reason must say revoke/rotate first.\n"
         "- For browser_login_metadata and chat_data_location, usually action should be review, not automatic cleanup.\n"
-        "- Never invent IDs.\n\n"
-        "Payload:\n"
+        "- Never invent IDs.\n"
+        + handled_block
+        + "\n\nPayload:\n"
         + json.dumps(payload, ensure_ascii=False, indent=2)
     )
+
+
+def normalize_review_result(
+    data: dict[str, Any],
+    allowed_ids: set[str],
+    excluded_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    excluded = excluded_ids or set()
+    selected_ids = [
+        str(item_id)
+        for item_id in data.get("selected_ids", [])
+        if str(item_id) in allowed_ids and str(item_id) not in excluded
+    ]
+    decisions = []
+    for decision in data.get("decisions", []):
+        item_id = str(decision.get("id", ""))
+        if item_id not in allowed_ids or item_id in excluded:
+            continue
+        decisions.append(
+            {
+                "id": item_id,
+                "action": str(decision.get("action", "review")),
+                "risk": str(decision.get("risk", "medium")),
+                "reason": str(decision.get("reason", "")),
+            }
+        )
+    return {
+        "summary": str(data.get("summary", "")),
+        "selected_ids": selected_ids,
+        "decisions": decisions,
+        "warnings": [str(warning) for warning in data.get("warnings", [])],
+    }
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
@@ -59,29 +100,6 @@ def extract_json_object(text: str) -> dict[str, Any]:
         if start == -1 or end == -1 or end <= start:
             raise
         return json.loads(stripped[start : end + 1])
-
-
-def normalize_review_result(data: dict[str, Any], allowed_ids: set[str]) -> dict[str, Any]:
-    selected_ids = [str(item_id) for item_id in data.get("selected_ids", []) if str(item_id) in allowed_ids]
-    decisions = []
-    for decision in data.get("decisions", []):
-        item_id = str(decision.get("id", ""))
-        if item_id not in allowed_ids:
-            continue
-        decisions.append(
-            {
-                "id": item_id,
-                "action": str(decision.get("action", "review")),
-                "risk": str(decision.get("risk", "medium")),
-                "reason": str(decision.get("reason", "")),
-            }
-        )
-    return {
-        "summary": str(data.get("summary", "")),
-        "selected_ids": selected_ids,
-        "decisions": decisions,
-        "warnings": [str(warning) for warning in data.get("warnings", [])],
-    }
 
 
 def list_openai_compatible_models(*, api_key: str, base_url: str, timeout: int = 30) -> list[str]:
@@ -137,4 +155,9 @@ def review_with_openai_compatible(
     except urllib.error.URLError as exc:
         raise RuntimeError(f"AI review request failed: {exc}") from exc
     content = response_body["choices"][0]["message"]["content"]
-    return normalize_review_result(extract_json_object(content), allowed_ids)
+    excluded_ids: set[str] = set()
+    for handled in (payload.get("user_feedback") or {}).get("handled_items") or []:
+        hid = handled.get("id")
+        if hid is not None:
+            excluded_ids.add(str(hid))
+    return normalize_review_result(extract_json_object(content), allowed_ids, excluded_ids)
