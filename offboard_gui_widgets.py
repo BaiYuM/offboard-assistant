@@ -70,6 +70,22 @@ class FirstRunWizard(tk.Toplevel):
         self.baseline_since = dt.date.today().isoformat()
         self._build()
 
+    def show(self) -> None:
+        """Center the dialog over its master and block until it is closed.
+
+        ``grab_set`` was already issued in ``__init__``, so user input is
+        funneled to the wizard until ``finish`` / ``skip`` runs ``destroy``.
+        """
+        self.update_idletasks()
+        try:
+            m = self.master
+            x = m.winfo_rootx() + (m.winfo_width() - self.winfo_width()) // 2
+            y = m.winfo_rooty() + (m.winfo_height() - self.winfo_height()) // 2
+            self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        except Exception:
+            pass
+        self.wait_window(self)
+
     def _build(self) -> None:
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
