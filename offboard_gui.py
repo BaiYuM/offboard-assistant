@@ -463,6 +463,11 @@ class OffboardGui(tk.Tk):
             messagebox.showerror("刷新失败", str(exc))
 
     def render_tree(self) -> None:
+        # Remember which iid was selected so we can re-focus and re-show its
+        # detail panel after the row set is replaced. ``<<TreeviewSelect>>``
+        # fires when the focused row is deleted, so we cannot rely on the
+        # event handler alone.
+        prior_focus = self.tree.focus()
         for row in self.tree.get_children():
             self.tree.delete(row)
         sidebar = getattr(self, "filter_sidebar", None)
@@ -487,6 +492,17 @@ class OffboardGui(tk.Tk):
                     when,
                 ),
             )
+        # Restore focus on the same iid if it survived the re-render, and
+        # push the item into the detail panel. Otherwise show the empty state.
+        if prior_focus and self.tree.exists(prior_focus):
+            self.tree.selection_set(prior_focus)
+            self.tree.focus(prior_focus)
+            for item in self.candidates:
+                if str(item.get("id")) == prior_focus:
+                    self.detail_panel.show_item(item)
+                    break
+        else:
+            self.detail_panel.show_item(None)
         counts: dict[str, int] = {}
         for item in self.candidates:
             counts[str(item.get("type", "unknown"))] = counts.get(str(item.get("type", "unknown")), 0) + 1

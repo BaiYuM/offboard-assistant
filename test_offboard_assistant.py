@@ -1085,5 +1085,64 @@ class PortableModeTests(unittest.TestCase):
             self.assertEqual(len(a.path_rules), len(b.path_rules))
 
 
+class RenderTreeDetailPanelTests(unittest.TestCase):
+    """Regression: detail panel must persist across render_tree() calls.
+
+    Pre-fix: render_tree() deleted all rows then re-inserted, which fires
+    <<TreeviewSelect>> with an empty focus(), so the detail panel was
+    wiped. Post-fix: render_tree() captures the prior focus and re-shows
+    the matching item if it still exists in self.candidates.
+    """
+
+    def _build_gui(self, root):
+        from unittest.mock import MagicMock
+        import importlib
+        gui = importlib.import_module("offboard_gui")
+        widgets = importlib.import_module("offboard_gui_widgets")
+        # Stub the FirstRunWizard prompt so init doesn't block on a modal.
+        gui.FirstRunWizard = MagicMock()
+        return gui.OffboardGui(None), widgets
+
+    def test_render_tree_preserves_focus_and_detail_panel(self):
+        import tempfile
+        from pathlib import Path
+        import json
+        import tkinter as tk
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            state_dir.mkdir(parents=True)
+            # Pre-populate state with a baseline + snapshot so refresh_data
+            # doesn't bail with "no baseline found".
+            (state_dir / "baseline.json").write_text(
+                json.dumps({"baseline_since": "2020-01-01", "items": []})
+            )
+            (state_dir / "latest-snapshot.json").write_text(
+                json.dumps({"items": [{"id": "a", "type": "ide_recent_project", "name": "alpha", "path": "/x", "modified_at": "2026-07-06T00:00:00+00:00"}]})
+            )
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                gui_obj, _widgets = self._build_gui(root)
+                gui_obj.state_dir = state_dir
+                gui_obj.refresh_data(rescan=False)
+                # Manually select the first row and verify detail panel populates.
+                gui_obj.tree.selection_set("a")
+                gui_obj.tree.focus("a")
+                gui_obj.update_idletasks()
+                gui_obj._on_tree_select()
+                text_after_click = gui_obj.detail_panel.text.get("1.0", "end")
+                self.assertIn("alpha", text_after_click)
+                # Now re-render (the original trigger: filter change, sort,
+                # refresh, sidebar checkbox toggle, etc).
+                gui_obj.render_tree()
+                text_after_rerender = gui_obj.detail_panel.text.get("1.0", "end")
+                self.assertIn(
+                    "alpha", text_after_rerender,
+                    f"detail panel should persist after render_tree(), got: {text_after_rerender!r}",
+                )
+            finally:
+                root.destroy()
+
+
 if __name__ == "__main__":
     unittest.main()
