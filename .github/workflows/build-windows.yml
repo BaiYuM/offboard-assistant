@@ -45,7 +45,7 @@ jobs:
         run: python -m unittest
 
       - name: Compile check
-        run: python -m py_compile offboard_assistant.py offboard_gui.py offboard_gui_widgets.py ai_reviewer.py sync_bundle.py
+        run: python -m py_compile offboard_assistant.py offboard_gui.py offboard_gui_widgets.py gui_task_runner.py ai_reviewer.py sync_bundle.py
 
       - name: Build release archive
         shell: pwsh

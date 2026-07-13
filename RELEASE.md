@@ -7,14 +7,14 @@ Offboard Assistant publishes a complete Windows one-dir archive. Do not attach
 ## 1. Prepare the release
 
 1. Set `offboard_assistant.APP_VERSION` to the release version, for example
-   `1.0.1`.
+   `1.1.0`.
 2. Update `CHANGELOG.md` and commit all intended release changes.
 3. Confirm the worktree is clean and run the checks:
 
 ```powershell
 git status --short
 python -m unittest
-python -m py_compile offboard_assistant.py offboard_gui.py offboard_gui_widgets.py ai_reviewer.py sync_bundle.py
+python -m py_compile offboard_assistant.py offboard_gui.py offboard_gui_widgets.py gui_task_runner.py ai_reviewer.py sync_bundle.py
 ```
 
 ## 2. Build locally
@@ -32,20 +32,20 @@ For an environment where `requirements-packaging.txt` is already installed:
 .\build_exe.ps1 -SkipInstall
 ```
 
-For version `1.0.1`, the outputs are:
+For version `1.1.0`, the outputs are:
 
 ```text
 dist\OffboardAssistant\
-release\OffboardAssistant-windows-x64-v1.0.1.zip
-release\OffboardAssistant-windows-x64-v1.0.1.zip.sha256
+release\OffboardAssistant-windows-x64-v1.1.0.zip
+release\OffboardAssistant-windows-x64-v1.1.0.zip.sha256
 ```
 
 Verify the archive hash and test the extracted directory, not only the EXE:
 
 ```powershell
-certutil -hashfile .\release\OffboardAssistant-windows-x64-v1.0.1.zip SHA256
-Get-Content .\release\OffboardAssistant-windows-x64-v1.0.1.zip.sha256
-Expand-Archive .\release\OffboardAssistant-windows-x64-v1.0.1.zip .\release\smoke-test
+certutil -hashfile .\release\OffboardAssistant-windows-x64-v1.1.0.zip SHA256
+Get-Content .\release\OffboardAssistant-windows-x64-v1.1.0.zip.sha256
+Expand-Archive .\release\OffboardAssistant-windows-x64-v1.1.0.zip .\release\smoke-test
 .\release\smoke-test\OffboardAssistant\OffboardAssistant.exe --version
 ```
 
@@ -56,8 +56,8 @@ runs tests and compile checks, builds the archive, uploads the ZIP and SHA-256
 as a workflow artifact, then creates a GitHub Release for tag builds.
 
 ```powershell
-git tag -a v1.0.1 -m "Offboard Assistant v1.0.1"
-git push origin v1.0.1
+git tag -a v1.1.0 -m "Offboard Assistant v1.1.0"
+git push origin v1.1.0
 ```
 
 A mismatched tag, failed test, failed build, or missing artifact stops the

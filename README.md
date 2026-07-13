@@ -10,9 +10,11 @@
 offboard_assistant.py       CLI 和核心扫描/差异/清理建议逻辑
 offboard_gui.py             可视化窗口和后台任务入口
 offboard_gui_widgets.py     GUI 重型控件
+gui_task_runner.py          Tk 主线程安全的后台任务执行器
 ai_reviewer.py              AI 审核与脱敏协议
 sync_bundle.py              加密导入导出与 WebDAV 同步
 test_offboard_assistant.py  单元测试
+tests/                      后台任务、扫描取消和 CLI 回归测试
 rules/                      默认扫描规则
 build_exe.ps1               Windows EXE 打包脚本
 ```
@@ -190,6 +192,8 @@ python .\offboard_assistant.py scan --scan-root "$env:APPDATA\ccswitch"
 - 导出/导入本地加密包。
 - 上传/下载 WebDAV 加密包。
 - 创建或删除 Windows 后台计划任务。
+- 扫描、基线、AI、同步、隔离和报告导出在后台执行，窗口保持响应。
+- 扫描支持阶段进度和协作式取消；写入/移动类操作完成前会阻止关闭窗口。
 
 安全限制：
 
@@ -290,7 +294,8 @@ CLI 可用 `--config <path>` 覆盖配置位置，或在配置里预填
 
 窗口底部状态条按严重度显示不同颜色圆点 + 文字背景：
 `info` 绿、 `warn` 黄、 `error` 红、 `busy` 灰。`messagebox` 弹窗
-保持原样（必须保留模态确认）。
+保持原样（必须保留模态确认）。后台任务期间状态条右侧显示进度和取消入口，
+同一时间只运行一个后台任务。
 
 ## 更新记录
 
@@ -354,7 +359,7 @@ EXE 也支持后台参数，供 Windows 计划任务调用：
 
 源码由 Git 标签自动归档；Windows 用户应下载 Release 中的 ZIP 和对应
 `.sha256` 文件。版本标签必须严格等于 `v<offboard_assistant.APP_VERSION>`，
-例如当前应用版本 `1.0.1` 对应标签 `v1.0.1`。
+例如当前应用版本 `1.1.0` 对应标签 `v1.1.0`。
 
 仓库可以包含：
 

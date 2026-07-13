@@ -382,6 +382,8 @@ class DetailPanel(ttk.Frame):
         item = self._current()
         if not item:
             return
+        if not self.controller._ensure_task_idle():
+            return
         target = core.recommended_cleanup_target(item)
         if not target:
             messagebox.showinfo("不支持隔离", "仅 recommend_cleanup 类型可自动隔离。", parent=self)
@@ -398,6 +400,8 @@ class DetailPanel(ttk.Frame):
     def _mark_handled(self) -> None:
         item = self._current()
         if not item:
+            return
+        if not self.controller._ensure_task_idle():
             return
         # Same idea as _quarantine_single: set the selection and reuse the
         # batch path so handled-items.json gets the same write semantics.

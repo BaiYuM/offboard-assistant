@@ -26,7 +26,7 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 try:
     import winreg
@@ -36,7 +36,7 @@ except ImportError:  # pragma: no cover - only available on Windows
 
 APP_DIR = ".offboard-assistant"
 APP_NAME = "OffboardAssistant"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.0"
 BASELINE_FILE = "baseline.json"
 SNAPSHOT_FILE = "latest-snapshot.json"
 REPORT_FILE = "offboarding-report.md"
@@ -987,7 +987,8 @@ def list_registry_values(root: Any, subkey: str) -> dict[str, str]:
     return values
 
 
-def scan_environment() -> list[dict[str, Any]]:
+def scan_environment(*, cancellation: Any = None) -> list[dict[str, Any]]:
+    _raise_if_scan_cancelled(cancellation)
     entries: list[dict[str, Any]] = []
     if winreg is not None:
         locations = [
@@ -1000,6 +1001,7 @@ def scan_environment() -> list[dict[str, Any]]:
         ]
         for scope, root, key in locations:
             for name in sorted(list_registry_values(root, key)):
+                _raise_if_scan_cancelled(cancellation)
                 entries.append(
                     {
                         "id": stable_id(["env", scope, name]),
@@ -1011,6 +1013,7 @@ def scan_environment() -> list[dict[str, Any]]:
                 )
     else:
         for name in sorted(os.environ):
+            _raise_if_scan_cancelled(cancellation)
             entries.append(
                 {
                     "id": stable_id(["env", "process", name]),
@@ -1085,7 +1088,8 @@ def split_path_like_value(value: str) -> list[str]:
     return entries
 
 
-def scan_installed_apps_from_registry() -> list[dict[str, Any]]:
+def scan_installed_apps_from_registry(*, cancellation: Any = None) -> list[dict[str, Any]]:
+    _raise_if_scan_cancelled(cancellation)
     if winreg is None:
         return []
     uninstall_paths = [
@@ -1099,10 +1103,12 @@ def scan_installed_apps_from_registry() -> list[dict[str, Any]]:
     ]
     apps: list[dict[str, Any]] = []
     for hive_name, root, subkey in uninstall_paths:
+        _raise_if_scan_cancelled(cancellation)
         try:
             with winreg.OpenKey(root, subkey) as key:
                 subkey_count = winreg.QueryInfoKey(key)[0]
                 for index in range(subkey_count):
+                    _raise_if_scan_cancelled(cancellation)
                     child_name = winreg.EnumKey(key, index)
                     child_path = f"{subkey}\\{child_name}"
                     values = list_registry_values(root, child_path)
@@ -1362,7 +1368,13 @@ def copy_for_read(path: Path, state_dir: Path) -> Path | None:
     return target
 
 
-def scan_chromium_logins(profile: BrowserProfile, state_dir: Path) -> list[dict[str, Any]]:
+def scan_chromium_logins(
+    profile: BrowserProfile,
+    state_dir: Path,
+    *,
+    cancellation: Any = None,
+) -> list[dict[str, Any]]:
+    _raise_if_scan_cancelled(cancellation)
     if profile.login_data is None:
         return []
     db_path = copy_for_read(profile.login_data, state_dir)
@@ -1388,7 +1400,8 @@ def scan_chromium_logins(profile: BrowserProfile, state_dir: Path) -> list[dict[
                 FROM logins
                 """
             )
-            for row in cursor.fetchall():
+            for row in cursor:
+                _raise_if_scan_cancelled(cancellation)
                 origin = row["origin_url"] or row["action_url"]
                 username_masked = mask_identifier(row["username_value"])
                 rows.append(
@@ -1433,7 +1446,8 @@ def scan_chromium_logins(profile: BrowserProfile, state_dir: Path) -> list[dict[
     return rows
 
 
-def scan_firefox_logins(profile: BrowserProfile) -> list[dict[str, Any]]:
+def scan_firefox_logins(profile: BrowserProfile, *, cancellation: Any = None) -> list[dict[str, Any]]:
+    _raise_if_scan_cancelled(cancellation)
     if profile.firefox_logins is None:
         return []
     try:
@@ -1451,6 +1465,7 @@ def scan_firefox_logins(profile: BrowserProfile) -> list[dict[str, Any]]:
         ]
     rows: list[dict[str, Any]] = []
     for item in data.get("logins", []):
+        _raise_if_scan_cancelled(cancellation)
         hostname = item.get("hostname")
         rows.append(
             {
@@ -1478,13 +1493,21 @@ def scan_firefox_logins(profile: BrowserProfile) -> list[dict[str, Any]]:
     return rows
 
 
-def scan_browser_logins(state_dir: Path) -> list[dict[str, Any]]:
+def scan_browser_logins(state_dir: Path, *, cancellation: Any = None) -> list[dict[str, Any]]:
+    _raise_if_scan_cancelled(cancellation)
     rows: list[dict[str, Any]] = []
     for profile in browser_profile_roots():
+        _raise_if_scan_cancelled(cancellation)
         if profile.login_data:
-            rows.extend(scan_chromium_logins(profile, state_dir))
+            if cancellation is None:
+                rows.extend(scan_chromium_logins(profile, state_dir))
+            else:
+                rows.extend(scan_chromium_logins(profile, state_dir, cancellation=cancellation))
         if profile.firefox_logins:
-            rows.extend(scan_firefox_logins(profile))
+            if cancellation is None:
+                rows.extend(scan_firefox_logins(profile))
+            else:
+                rows.extend(scan_firefox_logins(profile, cancellation=cancellation))
     return rows
 
 
@@ -1558,7 +1581,14 @@ def should_scan_file_contents(path: Path) -> bool:
     )
 
 
-def detect_secret_references(path: Path, max_bytes: int = 2 * 1024 * 1024, state_dir: Path | None = None) -> list[dict[str, Any]]:
+def detect_secret_references(
+    path: Path,
+    max_bytes: int = 2 * 1024 * 1024,
+    state_dir: Path | None = None,
+    *,
+    cancellation: Any = None,
+) -> list[dict[str, Any]]:
+    _raise_if_scan_cancelled(cancellation)
     try:
         stat = path.stat()
     except OSError:
@@ -1573,9 +1603,11 @@ def detect_secret_references(path: Path, max_bytes: int = 2 * 1024 * 1024, state
     seen: set[tuple[str, int, str]] = set()
     rules = load_rules(state_dir)
     for line_no, line in enumerate(text.splitlines(), start=1):
+        _raise_if_scan_cancelled(cancellation)
         if len(line) > 20000:
             continue
         for kind, pattern in rules.secret_patterns:
+            _raise_if_scan_cancelled(cancellation)
             for match in pattern.finditer(line):
                 secret = match.group(1) if match.lastindex else match.group(0)
                 key = (kind, line_no, secret_fingerprint(secret))
@@ -1594,14 +1626,50 @@ def detect_secret_references(path: Path, max_bytes: int = 2 * 1024 * 1024, state
     return findings
 
 
+class ScanCancelled(Exception):
+    """Raised when a cooperative snapshot scan is cancelled by its caller."""
+
+
+def _scan_cancelled(cancellation: Any) -> bool:
+    if cancellation is None:
+        return False
+    if callable(cancellation):
+        return bool(cancellation())
+    is_set = getattr(cancellation, "is_set", None)
+    return bool(is_set()) if callable(is_set) else bool(cancellation)
+
+
+def _raise_if_scan_cancelled(cancellation: Any) -> None:
+    if _scan_cancelled(cancellation):
+        raise ScanCancelled("Snapshot scan cancelled")
+
+
+def _report_scan_progress(
+    progress: Callable[[str, int, int], None] | None,
+    stage: str,
+    completed: int,
+    total: int,
+) -> None:
+    if progress is not None:
+        progress(stage, completed, total)
+
+
 def scan_sensitive_locations(
     roots: list[Path],
     max_files: int = 20000,
     state_dir: Path | None = None,
     config: dict[str, Any] | None = None,
+    *,
+    progress: Callable[[str, int, int], None] | None = None,
+    cancellation: Any = None,
 ) -> list[dict[str, Any]]:
+    _raise_if_scan_cancelled(cancellation)
     found: list[dict[str, Any]] = []
     visited = 0
+    last_reported = -1
+    if progress is not None:
+        _report_scan_progress(progress, "敏感文件", 0, max_files)
+        last_reported = 0
     excluded_paths: list[Path] = []
     for value in (config or {}).get("excluded_paths", []):
         if not isinstance(value, str) or not value.strip():
@@ -1632,9 +1700,11 @@ def scan_sensitive_locations(
     }
     limit_reached = False
     for root in roots:
+        _raise_if_scan_cancelled(cancellation)
         if not root.exists() or is_excluded(root):
             continue
         for dirpath, dirnames, filenames in os.walk(root):
+            _raise_if_scan_cancelled(cancellation)
             current_dir = Path(dirpath)
             dirnames[:] = sorted(
                 name
@@ -1642,14 +1712,28 @@ def scan_sensitive_locations(
                 if name not in ignored_dirs and not is_excluded(current_dir / name)
             )
             for filename in sorted(filenames):
+                _raise_if_scan_cancelled(cancellation)
                 if visited >= max_files:
                     limit_reached = True
                     break
                 visited += 1
+                if visited == 1 or visited % 100 == 0 or visited >= max_files:
+                    _report_scan_progress(progress, "敏感文件", visited, max_files)
+                    last_reported = visited
                 path = current_dir / filename
                 if not is_sensitive_name(path) and not should_scan_file_contents(path):
                     continue
-                secret_findings = detect_secret_references(path, state_dir=state_dir) if should_scan_file_contents(path) else []
+                if should_scan_file_contents(path):
+                    if cancellation is None:
+                        secret_findings = detect_secret_references(path, state_dir=state_dir)
+                    else:
+                        secret_findings = detect_secret_references(
+                            path,
+                            state_dir=state_dir,
+                            cancellation=cancellation,
+                        )
+                else:
+                    secret_findings = []
                 path_text = safe_rel(path)
                 category = categorize_path(path_text, config=config, state_dir=state_dir)
                 if secret_findings:
@@ -1672,6 +1756,8 @@ def scan_sensitive_locations(
                 break
         if limit_reached:
             break
+    if progress is not None and visited != last_reported:
+        _report_scan_progress(progress, "敏感文件", visited, max_files)
     return found
 
 
@@ -1693,9 +1779,11 @@ def known_chat_locations() -> list[tuple[str, Path]]:
     ]
 
 
-def scan_chat_locations() -> list[dict[str, Any]]:
+def scan_chat_locations(*, cancellation: Any = None) -> list[dict[str, Any]]:
+    _raise_if_scan_cancelled(cancellation)
     rows: list[dict[str, Any]] = []
     for app, path in known_chat_locations():
+        _raise_if_scan_cancelled(cancellation)
         if not path.exists():
             continue
         rows.append(
@@ -1715,7 +1803,11 @@ def scan_chat_locations() -> list[dict[str, Any]]:
     return rows
 
 
-def scan_recent_ide_projects(custom_roots: list[Path] | None = None) -> list[dict[str, Any]]:
+def scan_recent_ide_projects(
+    custom_roots: list[Path] | None = None,
+    *,
+    cancellation: Any = None,
+) -> list[dict[str, Any]]:
     """Discover recently-opened IDE projects without reading any sensitive content.
 
     Privacy boundary (per SECURITY.md):
@@ -1727,6 +1819,7 @@ def scan_recent_ide_projects(custom_roots: list[Path] | None = None) -> list[dic
       - Never reads ``argv.json`` — it can contain full local install paths.
       - Never reads any file content beyond XML element text.
     """
+    _raise_if_scan_cancelled(cancellation)
     roots: list[Path] = []
     if custom_roots:
         roots.extend(custom_roots)
@@ -1756,9 +1849,11 @@ def scan_recent_ide_projects(custom_roots: list[Path] | None = None) -> list[dic
     rows: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     for root in roots:
+        _raise_if_scan_cancelled(cancellation)
         if not root.exists():
             continue
         for xml_path in glob.glob(str(root / "*" / "options" / "recentProjects.xml")):
+            _raise_if_scan_cancelled(cancellation)
             ide_name = Path(xml_path).parent.parent.name
             try:
                 tree = ET.parse(xml_path)
@@ -1767,6 +1862,7 @@ def scan_recent_ide_projects(custom_roots: list[Path] | None = None) -> list[dic
                 continue
             try:
                 for entry in tree.getroot().findall(".//entry"):
+                    _raise_if_scan_cancelled(cancellation)
                     path = entry.get("key") or entry.get("path")
                     if not path:
                         continue
@@ -1775,6 +1871,7 @@ def scan_recent_ide_projects(custom_roots: list[Path] | None = None) -> list[dic
                     last_opened_raw: str | None = None
                     if meta is not None:
                         for opt in meta.findall("option"):
+                            _raise_if_scan_cancelled(cancellation)
                             oname = opt.get("name")
                             if oname == "projectName":
                                 project_name = opt.get("value")
@@ -1833,23 +1930,60 @@ def collect_snapshot(
     state_dir: Path,
     roots: list[Path],
     config: dict[str, Any] | None = None,
+    *,
+    progress: Callable[[str, int, int], None] | None = None,
+    cancellation: Any = None,
 ) -> dict[str, Any]:
     effective_config = config if config is not None else load_local_config(state_dir)
-    items = (
-        scan_environment()
-        + scan_installed_apps_from_registry()
-        + scan_browser_logins(state_dir)
-        + scan_sensitive_locations(roots, state_dir=state_dir, config=effective_config)
-        + scan_chat_locations()
-    )
-    if effective_config.get("ide_scan_enabled", True):
-        items.extend(scan_recent_ide_projects())
+    ide_enabled = bool(effective_config.get("ide_scan_enabled", True))
+    stage_names = ["环境变量", "已安装软件", "浏览器登录元数据", "敏感文件", "聊天数据位置"]
+    if ide_enabled:
+        stage_names.append("IDE 最近项目")
+    stage_names.append("整理候选项")
+    stages = len(stage_names)
+
+    def scan_call(scanner: Callable[..., list[dict[str, Any]]], *args: Any) -> list[dict[str, Any]]:
+        if cancellation is None:
+            return scanner(*args)
+        return scanner(*args, cancellation=cancellation)
+
+    def start_stage(index: int) -> None:
+        _raise_if_scan_cancelled(cancellation)
+        _report_scan_progress(progress, stage_names[index], index, stages)
+        # A progress callback can itself request cancellation (for example,
+        # the GUI close button). Honour it before entering the expensive work.
+        _raise_if_scan_cancelled(cancellation)
+
+    start_stage(0)
+    items = scan_call(scan_environment)
+    start_stage(1)
+    items.extend(scan_call(scan_installed_apps_from_registry))
+    start_stage(2)
+    items.extend(scan_call(scan_browser_logins, state_dir))
+    start_stage(3)
+    sensitive_kwargs: dict[str, Any] = {"state_dir": state_dir, "config": effective_config}
+    if progress is not None:
+        sensitive_kwargs["progress"] = progress
+    if cancellation is not None:
+        sensitive_kwargs["cancellation"] = cancellation
+    items.extend(scan_sensitive_locations(roots, **sensitive_kwargs))
+    start_stage(4)
+    items.extend(scan_call(scan_chat_locations))
+    if ide_enabled:
+        start_stage(5)
+        items.extend(scan_call(scan_recent_ide_projects))
+
+    organize_index = stages - 1
+    start_stage(organize_index)
     for item in items:
+        _raise_if_scan_cancelled(cancellation)
         item["account_owner_hint"] = infer_account_owner_hint(
             item,
             effective_config,
             state_dir=state_dir,
         )
+    _report_scan_progress(progress, stage_names[organize_index], stages, stages)
+    _raise_if_scan_cancelled(cancellation)
     return {
         "schema_version": 1,
         "generated_at": utc_now(),

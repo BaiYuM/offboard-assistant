@@ -4,6 +4,38 @@ All notable changes to Offboard Assistant are documented here. The format is
 loosely based on [Keep a Changelog](https://keepachangelog.com), and tagged
 releases follow Semantic Versioning.
 
+## [1.1.0] - 2026-07-13
+
+### Added
+
+- Added a Tk-safe single-worker task runner with queue-based progress events,
+  cooperative cancellation, exception delivery, duplicate-task protection, and
+  shutdown handling.
+- Added a persistent progress bar and cancel control to the GUI status bar.
+
+### Changed
+
+- Moved snapshot rescans, baseline creation, AI review/model discovery,
+  encryption import/export, WebDAV transfer, quarantine operations, report and
+  action exports, handled-item writes, and Windows task commands off the Tk
+  main thread.
+- GUI workers receive copied values only; all dialogs, widgets, status updates,
+  and message boxes remain on the owner thread.
+- Scans now report dynamically sized stage progress plus file progress and
+  honor cooperative cancellation throughout registry, browser, file, chat,
+  and IDE loops. A scan that reaches the cancelled terminal state never writes
+  a snapshot.
+- One active background task is allowed at a time. The window prevents closing
+  during non-cancellable write, move, and WebDAV operations and asks before
+  cancelling a scan or AI task.
+- WebDAV transfer staging uses fixed local filenames instead of deriving paths
+  from a user-provided remote filename.
+
+### Tests
+
+- Added task-runner, scan-cancellation, and GUI thread-boundary integration
+  tests. The full suite now covers 112 tests.
+
 ## [1.0.1] - 2026-07-13
 
 ### Security

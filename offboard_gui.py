@@ -10,9 +10,10 @@ import sys
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Any
+from typing import Any, Callable
 
 import ai_reviewer
+from gui_task_runner import TaskContext, TaskEvent, TaskRunner, TaskRunnerError
 import offboard_assistant as core
 import offboard_gui_widgets as widgets
 import sync_bundle
@@ -42,8 +43,15 @@ class OffboardGui(tk.Tk):
         self.selected_ids: set[str] = set()
         self.sort_column = "recommendation"
         self.sort_reverse = False
+        self._task_runner = TaskRunner()
+        self._task_controls: list[tk.Widget] = []
+        self._active_task_state: dict[str, Any] | None = None
+        self._task_poll_id: str | None = None
+        self._closing = False
 
         self._build_layout()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._task_poll_id = self.after(50, self._poll_task_events)
         self._load_sync_config()
         self.refresh_data(rescan=False)
 
@@ -74,6 +82,166 @@ class OffboardGui(tk.Tk):
             except (TypeError, ValueError):
                 pass
         return dt.date.today().isoformat()
+
+    def _task_button(self, parent: tk.Misc, **kwargs: Any) -> ttk.Button:
+        button = ttk.Button(parent, **kwargs)
+        self._task_controls.append(button)
+        return button
+
+    def _set_task_controls_enabled(self, enabled: bool) -> None:
+        state = ["!disabled"] if enabled else ["disabled"]
+        for control in self._task_controls:
+            try:
+                control.state(state)
+            except (AttributeError, tk.TclError):
+                continue
+
+    def _ensure_task_idle(self) -> bool:
+        if self._active_task_state is None and not self._task_runner.busy:
+            return True
+        active_name = (self._active_task_state or {}).get("name", "后台任务")
+        self.set_status(f"请等待“{active_name}”完成。", level=StatusLevel.WARN)
+        return False
+
+    def _start_background_task(
+        self,
+        name: str,
+        worker: Callable[[TaskContext], Any],
+        on_success: Callable[[Any], None],
+        *,
+        busy_text: str,
+        error_title: str,
+        on_error: Callable[[BaseException], None] | None = None,
+        cancellable: bool = False,
+    ) -> bool:
+        if self._closing:
+            return False
+        if not self._ensure_task_idle():
+            return False
+        try:
+            handle = self._task_runner.start(name, worker)
+        except TaskRunnerError as exc:
+            self.set_status(str(exc), level=StatusLevel.ERROR)
+            return False
+        self._active_task_state = {
+            "token": handle.token,
+            "name": name,
+            "on_success": on_success,
+            "on_error": on_error,
+            "error_title": error_title,
+            "cancellable": cancellable,
+        }
+        self._set_task_controls_enabled(False)
+        self.task_progress.stop()
+        self.task_progress.configure(mode="indeterminate", value=0)
+        self.task_progress.start(12)
+        self.task_cancel_button.state(["!disabled"] if cancellable else ["disabled"])
+        self.set_status(busy_text, level=StatusLevel.BUSY)
+        return True
+
+    def _poll_task_events(self) -> None:
+        if self._closing:
+            return
+        for event in self._task_runner.drain():
+            state = self._active_task_state
+            if state is None or event.token != state.get("token"):
+                continue
+            if event.kind == "progress":
+                self._apply_task_progress(event)
+                continue
+
+            self._active_task_state = None
+            self.task_progress.stop()
+            self.task_progress.configure(mode="determinate", value=0)
+            self.task_cancel_button.state(["disabled"])
+            self._set_task_controls_enabled(True)
+
+            try:
+                if event.kind == "success":
+                    state["on_success"](event.payload)
+                elif event.kind == "cancelled":
+                    self.set_status(f"已取消：{event.name}", level=StatusLevel.WARN)
+                else:
+                    exc = event.exception or RuntimeError(f"{event.name} failed")
+                    if state.get("on_error") is not None:
+                        state["on_error"](exc)
+                    else:
+                        messagebox.showerror(state["error_title"], str(exc), parent=self)
+                        self.set_status(f"{event.name}失败。", level=StatusLevel.ERROR)
+            except Exception as callback_error:
+                if not self._closing:
+                    messagebox.showerror("后台任务回调失败", str(callback_error), parent=self)
+                    self.set_status(f"{event.name}结果处理失败。", level=StatusLevel.ERROR)
+        try:
+            self._task_poll_id = self.after(50, self._poll_task_events)
+        except tk.TclError:
+            self._task_poll_id = None
+
+    def _apply_task_progress(self, event: TaskEvent) -> None:
+        payload = event.payload
+        if isinstance(payload, dict):
+            message = str(payload.get("message") or payload.get("stage") or event.name)
+            completed = payload.get("completed")
+            total = payload.get("total")
+            # Snapshot scans report a coarse stage (for example 3/7) and a
+            # nested sensitive-file counter (for example 100/20000). Keep
+            # the nested counter in the status text so the determinate bar
+            # never jumps backwards or changes units mid-scan.
+            detail = bool(payload.get("detail"))
+            if isinstance(completed, (int, float)) and isinstance(total, (int, float)) and total > 0:
+                if not detail:
+                    self.task_progress.stop()
+                    self.task_progress.configure(
+                        mode="determinate",
+                        maximum=float(total),
+                        value=min(float(completed), float(total)),
+                    )
+                message = f"{message} ({int(completed)}/{int(total)})"
+            self.set_status(message, level=StatusLevel.BUSY)
+            return
+        if payload:
+            self.set_status(str(payload), level=StatusLevel.BUSY)
+
+    def _cancel_active_task(self) -> None:
+        state = self._active_task_state
+        if state is None or not state.get("cancellable"):
+            return
+        if self._task_runner.cancel(str(state["token"])):
+            self.task_cancel_button.state(["disabled"])
+            self.set_status(f"正在取消：{state['name']}...", level=StatusLevel.BUSY)
+
+    def _on_close(self) -> None:
+        state = self._active_task_state
+        if state is not None and not state.get("cancellable"):
+            messagebox.showwarning("任务进行中", f"请等待“{state['name']}”完成后再关闭。", parent=self)
+            return
+        if state is not None and not messagebox.askyesno("取消并关闭", f"正在执行“{state['name']}”。取消任务并关闭窗口？", parent=self):
+            return
+        if state is not None and state.get("cancellable"):
+            handle = self._task_runner.active
+            if handle is not None:
+                handle.cancel()
+                # Do not destroy the window while a worker may still be in its
+                # commit section. Cooperative scans normally exit within a
+                # few milliseconds; network calls get a bounded grace period
+                # and can be retried from the close button if still blocked.
+                handle.thread.join(timeout=2.0)
+                if handle.thread.is_alive():
+                    self.set_status("任务仍在退出，请稍候后再关闭。", level=StatusLevel.WARN)
+                    messagebox.showwarning(
+                        "任务仍在运行",
+                        "任务尚未响应取消请求。请稍候片刻后再关闭窗口。",
+                        parent=self,
+                    )
+                    return
+        self._closing = True
+        self._task_runner.shutdown()
+        if self._task_poll_id is not None:
+            try:
+                self.after_cancel(self._task_poll_id)
+            except tk.TclError:
+                pass
+        self.destroy()
 
     def _build_layout(self) -> None:
         self.columnconfigure(0, weight=1)
@@ -119,6 +287,10 @@ class OffboardGui(tk.Tk):
             inner, textvariable=self.status_var, anchor="w", bg=StatusLevel.INFO.text_bg, fg="#1f2328"
         )
         self.status_label.pack(side="left", fill="x", expand=True)
+        self.task_cancel_button = ttk.Button(inner, text="取消", width=6, command=self._cancel_active_task, state="disabled")
+        self.task_cancel_button.pack(side="right")
+        self.task_progress = ttk.Progressbar(inner, mode="determinate", length=120, maximum=100, value=0)
+        self.task_progress.pack(side="right", padx=(8, 6))
 
     def _build_dashboard(self) -> None:
         self.dashboard.columnconfigure(0, weight=1)
@@ -133,14 +305,14 @@ class OffboardGui(tk.Tk):
         # accident on a busy layout.
         browse = ttk.Frame(toolbar)
         browse.pack(side="left", padx=(0, 10))
-        ttk.Button(browse, text="刷新", command=lambda: self.refresh_data(rescan=False)).pack(side="left", padx=(0, 6))
-        ttk.Button(browse, text="重新扫描", command=lambda: self.refresh_data(rescan=True)).pack(side="left", padx=(0, 6))
-        ttk.Button(browse, text="生成报告", command=self.generate_report).pack(side="left", padx=(0, 6))
+        self._task_button(browse, text="刷新", command=lambda: self.refresh_data(rescan=False)).pack(side="left", padx=(0, 6))
+        self._task_button(browse, text="重新扫描", command=lambda: self.refresh_data(rescan=True)).pack(side="left", padx=(0, 6))
+        self._task_button(browse, text="生成报告", command=self.generate_report).pack(side="left", padx=(0, 6))
 
         export_group = ttk.Frame(toolbar)
         export_group.pack(side="left", padx=(0, 10))
-        ttk.Button(export_group, text="导出清单", command=self.export_selected_plan).pack(side="left", padx=(0, 6))
-        ttk.Button(export_group, text="导出 AI 审核包", command=self.export_ai_review_pack).pack(side="left", padx=(0, 6))
+        self._task_button(export_group, text="导出清单", command=self.export_selected_plan).pack(side="left", padx=(0, 6))
+        self._task_button(export_group, text="导出 AI 审核包", command=self.export_ai_review_pack).pack(side="left", padx=(0, 6))
         ttk.Button(export_group, text="打开状态目录", command=self.open_state_dir).pack(side="left", padx=(0, 6))
 
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=4)
@@ -152,11 +324,12 @@ class OffboardGui(tk.Tk):
         ttk.Label(baseline_group, text="基线日期").pack(side="left", padx=(0, 4))
         self.baseline_since_var = tk.StringVar(value=self._configured_baseline_since())
         ttk.Entry(baseline_group, textvariable=self.baseline_since_var, width=12).pack(side="left", padx=(0, 6))
-        ttk.Button(baseline_group, text="建立/覆盖基线", command=self.init_baseline_from_gui).pack(side="left")
+        self._task_button(baseline_group, text="建立/覆盖基线", command=self.init_baseline_from_gui).pack(side="left")
 
         # Destructive actions go in an overflow menu so they don't compete
         # for horizontal space with the everyday buttons above.
         overflow = OverflowMenu(toolbar, label="更多操作 ▾")
+        self._task_controls.append(overflow)
         overflow.pack(side="right")
         overflow.add("隔离选中推荐项", self.quarantine_selected_recommended)
         overflow.add("标记选中已处理", self.mark_selected_handled)
@@ -319,11 +492,11 @@ class OffboardGui(tk.Tk):
         row += 1
         actions = ttk.Frame(self.sync_tab)
         actions.grid(row=row, column=0, columnspan=2, sticky="w", pady=(10, 4))
-        ttk.Button(actions, text="保存配置", command=self.save_sync_config).pack(side="left", padx=(0, 6))
-        ttk.Button(actions, text="导出加密包", command=self.export_bundle).pack(side="left", padx=(0, 6))
-        ttk.Button(actions, text="导入加密包", command=self.import_bundle).pack(side="left", padx=(0, 6))
-        ttk.Button(actions, text="上传到 WebDAV", command=self.upload_bundle).pack(side="left", padx=(0, 6))
-        ttk.Button(actions, text="从 WebDAV 下载", command=self.download_bundle).pack(side="left")
+        self._task_button(actions, text="保存配置", command=self.save_sync_config).pack(side="left", padx=(0, 6))
+        self._task_button(actions, text="导出加密包", command=self.export_bundle).pack(side="left", padx=(0, 6))
+        self._task_button(actions, text="导入加密包", command=self.import_bundle).pack(side="left", padx=(0, 6))
+        self._task_button(actions, text="上传到 WebDAV", command=self.upload_bundle).pack(side="left", padx=(0, 6))
+        self._task_button(actions, text="从 WebDAV 下载", command=self.download_bundle).pack(side="left")
 
         row += 1
         crypto_text = "可用" if sync_bundle.crypto_available() else "不可用：安装 cryptography 后启用"
@@ -349,7 +522,7 @@ class OffboardGui(tk.Tk):
         model_frame.columnconfigure(0, weight=1)
         self.ai_model_combo = ttk.Combobox(model_frame, textvariable=self.ai_model_var)
         self.ai_model_combo.grid(row=0, column=0, sticky="ew")
-        ttk.Button(model_frame, text="获取模型列表", command=self.fetch_ai_models).grid(row=0, column=1, padx=(6, 0))
+        self._task_button(model_frame, text="获取模型列表", command=self.fetch_ai_models).grid(row=0, column=1, padx=(6, 0))
 
         row += 1
         ttk.Label(self.ai_tab, text="API Key").grid(row=row, column=0, sticky="w", pady=4)
@@ -373,13 +546,13 @@ class OffboardGui(tk.Tk):
         row += 1
         buttons = ttk.Frame(self.ai_tab)
         buttons.grid(row=row, column=0, columnspan=2, sticky="w", pady=(10, 6))
-        ttk.Button(buttons, text="审核全部候选项并自动勾选", command=lambda: self.run_ai_review(use_selected=False)).pack(
+        self._task_button(buttons, text="审核全部候选项并自动勾选", command=lambda: self.run_ai_review(use_selected=False)).pack(
             side="left", padx=(0, 6)
         )
-        ttk.Button(buttons, text="只审核已勾选项", command=lambda: self.run_ai_review(use_selected=True)).pack(
+        self._task_button(buttons, text="只审核已勾选项", command=lambda: self.run_ai_review(use_selected=True)).pack(
             side="left", padx=(0, 6)
         )
-        ttk.Button(buttons, text="清空 AI 勾选", command=self.clear_selection).pack(side="left")
+        self._task_button(buttons, text="清空 AI 勾选", command=self.clear_selection).pack(side="left")
 
         row += 1
         note = (
@@ -417,10 +590,10 @@ class OffboardGui(tk.Tk):
 
         buttons = ttk.Frame(self.background_tab)
         buttons.grid(row=2, column=0, sticky="w", pady=(6, 8))
-        ttk.Button(buttons, text="创建安装监听任务", command=self.create_watch_task).pack(side="left", padx=(0, 6))
-        ttk.Button(buttons, text="创建每日扫描任务", command=self.create_daily_scan_task).pack(side="left", padx=(0, 6))
-        ttk.Button(buttons, text="删除后台任务", command=self.delete_background_tasks).pack(side="left", padx=(0, 6))
-        ttk.Button(buttons, text="查看任务状态", command=self.query_background_tasks).pack(side="left")
+        self._task_button(buttons, text="创建安装监听任务", command=self.create_watch_task).pack(side="left", padx=(0, 6))
+        self._task_button(buttons, text="创建每日扫描任务", command=self.create_daily_scan_task).pack(side="left", padx=(0, 6))
+        self._task_button(buttons, text="删除后台任务", command=self.delete_background_tasks).pack(side="left", padx=(0, 6))
+        self._task_button(buttons, text="查看任务状态", command=self.query_background_tasks).pack(side="left")
 
         self.bg_output = tk.Text(self.background_tab, wrap="word", height=16)
         self.bg_output.grid(row=3, column=0, sticky="nsew")
@@ -461,6 +634,25 @@ class OffboardGui(tk.Tk):
         )
         self.set_status("同步配置已保存。密码和加密口令不会保存。", level=StatusLevel.INFO)
 
+    @staticmethod
+    def _refresh_result(state_dir: Path, baseline: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+        since = core.parse_since(baseline.get("baseline_since") or baseline.get("generated_at"))
+        candidates = core.diff_items(snapshot.get("items", []), baseline.get("items", []), since)
+        for event in core.install_events_since(state_dir / core.INSTALL_EVENTS_FILE, since):
+            item = dict(event)
+            item["cleanup_confidence"] = "monitor_install_activity"
+            item["exists_in_baseline"] = False
+            item["after_since"] = True
+            candidates.append(item)
+        return {"baseline": baseline, "snapshot": snapshot, "candidates": candidates}
+
+    def _apply_refresh_result(self, result: dict[str, Any]) -> None:
+        baseline = result["baseline"]
+        self.baseline_since_var.set(str(baseline.get("baseline_since", ""))[:10])
+        self.candidates = result["candidates"]
+        self.render_tree()
+        self.set_status(f"已加载 {len(self.candidates)} 个候选项。状态目录：{self.state_dir}", level=StatusLevel.INFO)
+
     def refresh_data(self, rescan: bool) -> None:
         try:
             self.local_config = core.load_local_config(self.state_dir)
@@ -471,27 +663,58 @@ class OffboardGui(tk.Tk):
                 self.set_status(f"未找到基线。请点击重新扫描前先建立基线。状态目录：{self.state_dir}", level=StatusLevel.WARN)
                 return
             baseline = core.read_json(baseline_path)
-            if baseline.get("baseline_since"):
-                self.baseline_since_var.set(str(baseline.get("baseline_since", ""))[:10])
             snapshot_path = self.state_dir / core.SNAPSHOT_FILE
-            if rescan or not snapshot_path.exists():
-                roots = core.resolve_scan_roots([], self.local_config)
-                snapshot = core.collect_snapshot(self.state_dir, roots, config=self.local_config)
-                core.write_json(snapshot_path, snapshot)
-            else:
-                snapshot = core.read_json(snapshot_path)
-            since = core.parse_since(baseline.get("baseline_since") or baseline.get("generated_at"))
-            self.candidates = core.diff_items(snapshot.get("items", []), baseline.get("items", []), since)
-            for event in core.install_events_since(self.state_dir / core.INSTALL_EVENTS_FILE, since):
-                item = dict(event)
-                item["cleanup_confidence"] = "monitor_install_activity"
-                item["exists_in_baseline"] = False
-                item["after_since"] = True
-                self.candidates.append(item)
-            self.render_tree()
-            self.set_status(f"已加载 {len(self.candidates)} 个候选项。状态目录：{self.state_dir}", level=StatusLevel.INFO)
+            if not rescan and snapshot_path.exists():
+                self._apply_refresh_result(self._refresh_result(self.state_dir, baseline, core.read_json(snapshot_path)))
+                return
         except Exception as exc:
-            messagebox.showerror("刷新失败", str(exc))
+            messagebox.showerror("刷新失败", str(exc), parent=self)
+            return
+
+        roots = core.resolve_scan_roots([], dict(self.local_config))
+        config = dict(self.local_config)
+        state_dir = self.state_dir
+
+        def worker(context: TaskContext) -> dict[str, Any]:
+            stage_total: int | None = None
+
+            def report(stage: str, completed: int, total: int) -> None:
+                nonlocal stage_total
+                if stage_total is None:
+                    stage_total = total
+                context.report_progress(
+                    {
+                        "message": stage,
+                        "stage": stage,
+                        "completed": completed,
+                        "total": total,
+                        "detail": total != stage_total,
+                    }
+                )
+
+            try:
+                snapshot = core.collect_snapshot(
+                    state_dir,
+                    roots,
+                    config=config,
+                    progress=report,
+                    cancellation=context.cancel_event,
+                )
+            except core.ScanCancelled:
+                context.raise_if_cancelled()
+                raise
+            context.raise_if_cancelled()
+            core.write_json(snapshot_path, snapshot)
+            return OffboardGui._refresh_result(state_dir, baseline, snapshot)
+
+        self._start_background_task(
+            "扫描",
+            worker,
+            self._apply_refresh_result,
+            busy_text="正在扫描，请稍候...",
+            error_title="刷新失败",
+            cancellable=True,
+        )
 
     def render_tree(self) -> None:
         # Remember which iid was selected so we can re-focus and re-show its
@@ -590,17 +813,71 @@ class OffboardGui(tk.Tk):
         if not messagebox.askyesno("覆盖基线", f"将覆盖当前基线并使用日期 {since}。是否继续？"):
             return
         try:
-            core.parse_since(since)
-            self.local_config = core.load_local_config(self.state_dir)
-            roots = core.resolve_scan_roots([], self.local_config)
-            snapshot = core.collect_snapshot(self.state_dir, roots, config=self.local_config)
-            snapshot["baseline_since"] = core.parse_since(since).isoformat()
-            core.write_json(self.state_dir / core.BASELINE_FILE, snapshot)
-            self.selected_ids.clear()
-            self.refresh_data(rescan=True)
-            self.set_status(f"基线已建立：{self.state_dir / core.BASELINE_FILE}", level=StatusLevel.INFO)
+            parsed_since = core.parse_since(since)
         except Exception as exc:
-            messagebox.showerror("建立基线失败", str(exc))
+            messagebox.showerror("建立基线失败", str(exc), parent=self)
+            return
+
+        self.local_config = core.load_local_config(self.state_dir)
+        roots = core.resolve_scan_roots([], dict(self.local_config))
+        config = dict(self.local_config)
+        state_dir = self.state_dir
+        baseline_path = state_dir / core.BASELINE_FILE
+        snapshot_path = state_dir / core.SNAPSHOT_FILE
+
+        def worker(context: TaskContext) -> dict[str, Any]:
+            stage_total: int | None = None
+
+            def report(stage: str, completed: int, total: int) -> None:
+                nonlocal stage_total
+                if stage_total is None:
+                    stage_total = total
+                context.report_progress(
+                    {
+                        "message": stage,
+                        "stage": stage,
+                        "completed": completed,
+                        "total": total,
+                        "detail": total != stage_total,
+                    }
+                )
+
+            try:
+                snapshot = core.collect_snapshot(
+                    state_dir,
+                    roots,
+                    config=config,
+                    progress=report,
+                    cancellation=context.cancel_event,
+                )
+            except core.ScanCancelled:
+                context.raise_if_cancelled()
+                raise
+            context.raise_if_cancelled()
+            baseline = dict(snapshot)
+            baseline["baseline_since"] = parsed_since.isoformat()
+            # The baseline is also the latest known snapshot. This avoids an
+            # immediate second full scan after the user establishes a baseline.
+            # Treat both writes as one commit section: once the cancellation
+            # check above passes, finish the pair and report success rather
+            # than leaving a new baseline beside an old snapshot.
+            core.write_json(snapshot_path, snapshot)
+            core.write_json(baseline_path, baseline)
+            return {"baseline": baseline, "snapshot": snapshot, "candidates": []}
+
+        def on_success(result: dict[str, Any]) -> None:
+            self.selected_ids.clear()
+            self._apply_refresh_result(result)
+            self.set_status(f"基线已建立：{baseline_path}", level=StatusLevel.INFO)
+
+        self._start_background_task(
+            "建立基线",
+            worker,
+            on_success,
+            busy_text="正在建立基线，请稍候...",
+            error_title="建立基线失败",
+            cancellable=True,
+        )
 
     def toggle_current_selection(self, _event: object | None = None) -> None:
         focused = self.tree.focus()
@@ -621,25 +898,44 @@ class OffboardGui(tk.Tk):
         return [item for item in self.candidates if str(item.get("id")) in self.selected_ids]
 
     def run_ai_review(self, use_selected: bool) -> None:
-        items = self.selected_items() if use_selected else self.candidates
+        items = list(self.selected_items() if use_selected else self.candidates)
         if not items:
             messagebox.showinfo("没有候选项", "当前没有可审核的候选项。")
             return
-        payload = core.ai_review_payload_for_items(items, state_dir=self.state_dir)
-        self.set_status("AI 审核中，请稍候...", level=StatusLevel.BUSY)
-        self.update_idletasks()
-        try:
+        api_key = self.ai_api_key_var.get()
+        base_url = self.ai_base_url_var.get().strip()
+        model = self.ai_model_var.get().strip()
+        policy = self.ai_selection_policy_var.get()
+        state_dir = self.state_dir
+
+        def worker(context: TaskContext) -> dict[str, Any]:
+            context.report_progress("正在整理脱敏审核数据...")
+            payload = core.ai_review_payload_for_items(items, state_dir=state_dir)
+            context.raise_if_cancelled()
+            context.report_progress("正在等待 AI 审核结果...")
             result = ai_reviewer.review_with_openai_compatible(
-                api_key=self.ai_api_key_var.get(),
-                base_url=self.ai_base_url_var.get().strip(),
-                model=self.ai_model_var.get().strip(),
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
                 payload=payload,
             )
-        except Exception as exc:
-            messagebox.showerror("AI 审核失败", str(exc))
-            self.set_status("AI 审核失败。", level=StatusLevel.ERROR)
-            return
-        selected_by_ai = self.ai_selected_ids_for_policy(result)
+            context.raise_if_cancelled()
+            return result
+
+        def on_success(result: dict[str, Any]) -> None:
+            self._apply_ai_review_result(result, policy)
+
+        self._start_background_task(
+            "AI 审核",
+            worker,
+            on_success,
+            busy_text="AI 审核中，请稍候...",
+            error_title="AI 审核失败",
+            cancellable=True,
+        )
+
+    def _apply_ai_review_result(self, result: dict[str, Any], policy: str) -> None:
+        selected_by_ai = self.ai_selected_ids_for_policy(result, policy=policy)
         for item_id in selected_by_ai:
             self.selected_ids.add(str(item_id))
         self.render_tree()
@@ -659,8 +955,8 @@ class OffboardGui(tk.Tk):
             )
         self.set_status(f"AI 已按当前策略勾选 {len(selected_by_ai)} 项。请确认后再隔离或导出清单。", level=StatusLevel.INFO)
 
-    def ai_selected_ids_for_policy(self, result: dict[str, Any]) -> set[str]:
-        policy = self.ai_selection_policy_var.get()
+    def ai_selected_ids_for_policy(self, result: dict[str, Any], policy: str | None = None) -> set[str]:
+        policy = policy if policy is not None else self.ai_selection_policy_var.get()
         selected = {str(item_id) for item_id in result.get("selected_ids", [])}
         for decision in result.get("decisions", []):
             item_id = str(decision.get("id", ""))
@@ -680,33 +976,60 @@ class OffboardGui(tk.Tk):
         return selected
 
     def fetch_ai_models(self) -> None:
-        self.set_status("正在获取模型列表...", level=StatusLevel.BUSY)
-        self.update_idletasks()
-        try:
+        api_key = self.ai_api_key_var.get()
+        base_url = self.ai_base_url_var.get().strip()
+
+        def worker(context: TaskContext) -> list[str]:
+            context.report_progress("正在获取模型列表...")
             models = ai_reviewer.list_openai_compatible_models(
-                api_key=self.ai_api_key_var.get(),
-                base_url=self.ai_base_url_var.get().strip(),
+                api_key=api_key,
+                base_url=base_url,
             )
-        except Exception as exc:
-            messagebox.showerror("获取模型列表失败", str(exc))
+            context.raise_if_cancelled()
+            return models
+
+        def on_success(models: list[str]) -> None:
+            self.ai_model_combo["values"] = models
+            if models and self.ai_model_var.get() not in models:
+                self.ai_model_var.set(models[0])
+            self.set_status(f"已获取 {len(models)} 个模型。", level=StatusLevel.INFO)
+
+        def on_error(exc: BaseException) -> None:
+            messagebox.showerror("获取模型列表失败", str(exc), parent=self)
             self.set_status("获取模型列表失败。可继续手动输入模型名。", level=StatusLevel.ERROR)
-            return
-        self.ai_model_combo["values"] = models
-        if models and self.ai_model_var.get() not in models:
-            self.ai_model_var.set(models[0])
-        self.set_status(f"已获取 {len(models)} 个模型。", level=StatusLevel.INFO)
+
+        self._start_background_task(
+            "获取模型列表",
+            worker,
+            on_success,
+            busy_text="正在获取模型列表...",
+            error_title="获取模型列表失败",
+            on_error=on_error,
+            cancellable=True,
+        )
 
     def generate_report(self) -> None:
-        try:
-            baseline = core.read_json(self.state_dir / core.BASELINE_FILE)
-            snapshot = core.read_json(self.state_dir / core.SNAPSHOT_FILE)
+        state_dir = self.state_dir
+        candidates = [dict(item) for item in self.candidates]
+
+        def worker(context: TaskContext) -> Path:
+            context.report_progress("正在生成报告...")
+            baseline = core.read_json(state_dir / core.BASELINE_FILE)
+            snapshot = core.read_json(state_dir / core.SNAPSHOT_FILE)
             since = core.parse_since(baseline.get("baseline_since") or baseline.get("generated_at"))
-            report = core.render_report(since, snapshot, self.candidates)
-            path = self.state_dir / core.REPORT_FILE
+            report = core.render_report(since, snapshot, candidates)
+            path = state_dir / core.REPORT_FILE
             path.write_text(report, encoding="utf-8")
-            self.set_status(f"报告已生成：{path}", level=StatusLevel.INFO)
-        except Exception as exc:
-            messagebox.showerror("生成报告失败", str(exc))
+            return path
+
+        self._start_background_task(
+            "生成报告",
+            worker,
+            lambda path: self.set_status(f"报告已生成：{path}", level=StatusLevel.INFO),
+            busy_text="正在生成报告...",
+            error_title="生成报告失败",
+            cancellable=False,
+        )
 
     def export_selected_plan(self) -> None:
         items = self.selected_items()
@@ -720,9 +1043,23 @@ class OffboardGui(tk.Tk):
         )
         if not path:
             return
-        actions = core.cleanup_actions_for_items(items)
-        Path(path).write_text(core.render_cleanup_actions_markdown(actions), encoding="utf-8")
-        self.set_status(f"选中清理清单已导出：{path}", level=StatusLevel.INFO)
+        output_path = Path(path)
+        items_snapshot = [dict(item) for item in items]
+
+        def worker(context: TaskContext) -> Path:
+            context.report_progress("正在导出清理清单...")
+            actions = core.cleanup_actions_for_items(items_snapshot)
+            output_path.write_text(core.render_cleanup_actions_markdown(actions), encoding="utf-8")
+            return output_path
+
+        self._start_background_task(
+            "导出清理清单",
+            worker,
+            lambda result: self.set_status(f"选中清理清单已导出：{result}", level=StatusLevel.INFO),
+            busy_text="正在导出清理清单...",
+            error_title="导出清单失败",
+            cancellable=False,
+        )
 
     def export_ai_review_pack(self) -> None:
         items = self.selected_items() or self.candidates
@@ -737,11 +1074,28 @@ class OffboardGui(tk.Tk):
         )
         if not path:
             return
-        payload = core.ai_review_payload_for_items(items, state_dir=self.state_dir)
-        Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        self.set_status(f"AI 审核包已导出：{path}", level=StatusLevel.INFO)
+        output_path = Path(path)
+        items_snapshot = [dict(item) for item in items]
+        state_dir = self.state_dir
+
+        def worker(context: TaskContext) -> Path:
+            context.report_progress("正在生成脱敏审核包...")
+            payload = core.ai_review_payload_for_items(items_snapshot, state_dir=state_dir)
+            output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            return output_path
+
+        self._start_background_task(
+            "导出 AI 审核包",
+            worker,
+            lambda result: self.set_status(f"AI 审核包已导出：{result}", level=StatusLevel.INFO),
+            busy_text="正在生成脱敏审核包...",
+            error_title="导出 AI 审核包失败",
+            cancellable=False,
+        )
 
     def quarantine_selected_recommended(self) -> None:
+        if not self._ensure_task_idle():
+            return
         items = self.selected_items()
         if not items:
             messagebox.showinfo("没有选中项", "请先双击候选项进行勾选。")
@@ -764,54 +1118,108 @@ class OffboardGui(tk.Tk):
         )
         if not messagebox.askyesno("确认隔离", message):
             return
-        manifest_rows: list[dict[str, Any]] = []
-        quarantine_root = self.state_dir / "quarantine" / dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-        quarantine_root.mkdir(parents=True, exist_ok=True)
-        errors: list[str] = []
-        for index, (target_text, item) in enumerate(targets.items(), start=1):
-            source = Path(target_text)
-            if not source.exists():
-                errors.append(f"不存在：{source}")
-                continue
-            destination = quarantine_root / f"{index:03d}-{source.name}"
-            try:
-                shutil.move(str(source), str(destination))
-                manifest_rows.append(
+        state_dir = self.state_dir
+        target_rows = [(target, dict(item)) for target, item in targets.items()]
+
+        def worker(context: TaskContext) -> dict[str, Any]:
+            quarantine_root = state_dir / "quarantine" / dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+            quarantine_root.mkdir(parents=True, exist_ok=True)
+            manifest_rows: list[dict[str, Any]] = []
+            errors: list[str] = []
+            for index, (target_text, item) in enumerate(target_rows, start=1):
+                context.report_progress(
                     {
-                        "source": str(source),
-                        "destination": str(destination),
-                        "item_id": item.get("id"),
-                        "category": item.get("category"),
-                        "moved_at": core.utc_now(),
+                        "message": f"正在隔离文件 ({index}/{len(target_rows)})",
+                        "completed": index - 1,
+                        "total": len(target_rows),
                     }
                 )
-            except OSError as exc:
-                errors.append(f"{source}: {exc}")
-        manifest_path = quarantine_root / "manifest.json"
-        manifest_path.write_text(json.dumps({"items": manifest_rows, "errors": errors}, ensure_ascii=False, indent=2), encoding="utf-8")
-        # Mirror the manifest into the SQLite accelerator. Best-effort; the
-        # manifest.json is the source of truth, so any error here is silent.
-        core._index_quarantine_batch(self.state_dir, quarantine_root, {"items": manifest_rows, "errors": errors})
-        if errors:
-            messagebox.showwarning("部分隔离失败", "\n".join(errors[:10]))
-        self.selected_ids.clear()
-        self.refresh_data(rescan=True)
-        self.set_status(f"已隔离 {len(manifest_rows)} 项到：{quarantine_root}", level=StatusLevel.WARN if errors else StatusLevel.INFO)
+                source = Path(target_text)
+                if not source.exists():
+                    errors.append(f"不存在：{source}")
+                    continue
+                destination = quarantine_root / f"{index:03d}-{source.name}"
+                try:
+                    shutil.move(str(source), str(destination))
+                    manifest_rows.append(
+                        {
+                            "source": str(source),
+                            "destination": str(destination),
+                            "item_id": item.get("id"),
+                            "category": item.get("category"),
+                            "moved_at": core.utc_now(),
+                        }
+                    )
+                except OSError as exc:
+                    errors.append(f"{source}: {exc}")
+            manifest = {"items": manifest_rows, "errors": errors}
+            manifest_path = quarantine_root / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            # Mirror the manifest into the SQLite accelerator. Best-effort; the
+            # manifest.json is the source of truth, so any error here is silent.
+            core._index_quarantine_batch(state_dir, quarantine_root, manifest)
+            return {"quarantine_root": quarantine_root, "manifest_rows": manifest_rows, "errors": errors}
+
+        def on_success(result: dict[str, Any]) -> None:
+            errors = result["errors"]
+            if errors:
+                messagebox.showwarning("部分隔离失败", "\n".join(errors[:10]), parent=self)
+            self.selected_ids.clear()
+            self.refresh_data(rescan=True)
+            self.set_status(
+                f"已隔离 {len(result['manifest_rows'])} 项到：{result['quarantine_root']}",
+                level=StatusLevel.WARN if errors else StatusLevel.INFO,
+            )
+
+        self._start_background_task(
+            "隔离文件",
+            worker,
+            on_success,
+            busy_text="正在隔离选中项目...",
+            error_title="隔离失败",
+            cancellable=False,
+        )
 
     def mark_selected_handled(self) -> None:
+        if not self._ensure_task_idle():
+            return
         items = self.selected_items()
         if not items:
             messagebox.showinfo("没有选中项", "请先双击候选项进行勾选。")
             return
-        path = self.state_dir / "handled-items.json"
-        existing = core.read_json(path) if path.exists() else {"items": []}
-        handled = existing.get("items", [])
-        for item in items:
-            handled.append({"id": item.get("id"), "type": item.get("type"), "title": describe_item(item)[0], "handled_at": core.utc_now()})
-        core.write_json(path, {"items": handled})
-        self.selected_ids.clear()
-        self.render_tree()
-        self.set_status(f"已标记 {len(items)} 项为已处理。", level=StatusLevel.INFO)
+        state_dir = self.state_dir
+        items_snapshot = [dict(item) for item in items]
+
+        def worker(context: TaskContext) -> int:
+            context.report_progress("正在记录已处理项目...")
+            path = state_dir / "handled-items.json"
+            existing = core.read_json(path) if path.exists() else {"items": []}
+            handled = existing.get("items", [])
+            for item in items_snapshot:
+                handled.append(
+                    {
+                        "id": item.get("id"),
+                        "type": item.get("type"),
+                        "title": describe_item(item)[0],
+                        "handled_at": core.utc_now(),
+                    }
+                )
+            core.write_json(path, {"items": handled})
+            return len(items_snapshot)
+
+        def on_success(count: int) -> None:
+            self.selected_ids.clear()
+            self.render_tree()
+            self.set_status(f"已标记 {count} 项为已处理。", level=StatusLevel.INFO)
+
+        self._start_background_task(
+            "标记已处理",
+            worker,
+            on_success,
+            busy_text="正在记录已处理项目...",
+            error_title="标记失败",
+            cancellable=False,
+        )
 
     def open_quarantine_manager(self) -> None:
         bundles = core.list_quarantine_bundles(self.state_dir)
@@ -851,38 +1259,101 @@ class OffboardGui(tk.Tk):
             focused = tree.focus()
             return focused or None
 
+        def _window_exists() -> bool:
+            try:
+                return bool(window.winfo_exists())
+            except tk.TclError:
+                return False
+
         def _restore() -> None:
+            if not self._ensure_task_idle():
+                return
             directory = _selected()
             if not directory:
                 messagebox.showinfo("未选择", "请先选择一行。", parent=window)
                 return
             if not messagebox.askyesno("确认还原", f"将把该批次的文件移回原路径。如果原路径已有同名文件会被跳过。继续？", parent=window):
                 return
-            try:
-                result = core.restore_quarantine_dir(Path(directory))
-            except FileNotFoundError as exc:
-                messagebox.showerror("还原失败", str(exc), parent=window)
-                return
-            messagebox.showinfo(
-                "还原完成",
-                f"已还原 {len(result['restored'])} 项，跳过 {len(result['skipped'])} 项，错误 {len(result['errors'])} 项。",
-                parent=window,
+            directory_path = Path(directory)
+
+            def worker(context: TaskContext) -> dict[str, Any]:
+                context.report_progress("正在还原隔离批次...")
+                return core.restore_quarantine_dir(directory_path)
+
+            def on_success(result: dict[str, Any]) -> None:
+                restored = len(result["restored"])
+                skipped = len(result["skipped"])
+                errors = len(result["errors"])
+                self.set_status(
+                    f"隔离批次已还原：{restored} 项，跳过 {skipped} 项，错误 {errors} 项。",
+                    level=StatusLevel.WARN if errors else StatusLevel.INFO,
+                )
+                if not _window_exists():
+                    return
+                messagebox.showinfo(
+                    "还原完成",
+                    f"已还原 {restored} 项，跳过 {skipped} 项，错误 {errors} 项。",
+                    parent=window,
+                )
+                window.destroy()
+
+            def on_error(exc: BaseException) -> None:
+                self.set_status("还原隔离批次失败。", level=StatusLevel.ERROR)
+                if _window_exists():
+                    messagebox.showerror("还原失败", str(exc), parent=window)
+
+            self._start_background_task(
+                "还原隔离批次",
+                worker,
+                on_success,
+                busy_text="正在还原隔离批次...",
+                error_title="还原失败",
+                on_error=on_error,
+                cancellable=False,
             )
-            window.destroy()
 
         def _purge() -> None:
+            if not self._ensure_task_idle():
+                return
             directory = _selected()
             if not directory:
                 messagebox.showinfo("未选择", "请先选择一行。", parent=window)
                 return
             if not messagebox.askyesno("永久删除", f"将永久删除该批次（不可恢复）。是否继续？", parent=window):
                 return
-            result = core.purge_quarantine_dir(Path(directory))
-            if result["purged"]:
-                messagebox.showinfo("已删除", "该批次已永久删除。", parent=window)
-                window.destroy()
-            else:
-                messagebox.showerror("删除失败", "\n".join(result["errors"]), parent=window)
+            directory_path = Path(directory)
+
+            def worker(context: TaskContext) -> dict[str, Any]:
+                context.report_progress("正在永久删除隔离批次...")
+                return core.purge_quarantine_dir(directory_path)
+
+            def on_success(result: dict[str, Any]) -> None:
+                if result["purged"]:
+                    self.set_status("隔离批次已永久删除。", level=StatusLevel.INFO)
+                else:
+                    self.set_status("永久删除隔离批次失败。", level=StatusLevel.ERROR)
+                if not _window_exists():
+                    return
+                if result["purged"]:
+                    messagebox.showinfo("已删除", "该批次已永久删除。", parent=window)
+                    window.destroy()
+                else:
+                    messagebox.showerror("删除失败", "\n".join(result["errors"]), parent=window)
+
+            def on_error(exc: BaseException) -> None:
+                self.set_status("永久删除隔离批次失败。", level=StatusLevel.ERROR)
+                if _window_exists():
+                    messagebox.showerror("删除失败", str(exc), parent=window)
+
+            self._start_background_task(
+                "永久删除隔离批次",
+                worker,
+                on_success,
+                busy_text="正在永久删除隔离批次...",
+                error_title="删除失败",
+                on_error=on_error,
+                cancellable=False,
+            )
 
         ttk.Button(button_frame, text="还原", command=_restore).pack(side="left", padx=(0, 6))
         ttk.Button(button_frame, text="永久删除", command=_purge).pack(side="left", padx=(0, 6))
@@ -897,57 +1368,125 @@ class OffboardGui(tk.Tk):
         )
         if not path_text:
             return None
-        try:
-            sync_bundle.export_encrypted_bundle(self.state_dir, Path(path_text), self.passphrase_var.get())
-            self.set_status(f"加密包已导出：{path_text}", level=StatusLevel.INFO)
-            return Path(path_text)
-        except Exception as exc:
-            messagebox.showerror("导出失败", str(exc))
-            return None
+        output_path = Path(path_text)
+        state_dir = self.state_dir
+        passphrase = self.passphrase_var.get()
+
+        def worker(context: TaskContext) -> Path:
+            context.report_progress("正在生成加密包...")
+            sync_bundle.export_encrypted_bundle(state_dir, output_path, passphrase)
+            return output_path
+
+        self._start_background_task(
+            "导出加密包",
+            worker,
+            lambda path: self.set_status(f"加密包已导出：{path}", level=StatusLevel.INFO),
+            busy_text="正在生成加密包...",
+            error_title="导出失败",
+            cancellable=False,
+        )
+        return None
 
     def import_bundle(self) -> None:
         path_text = filedialog.askopenfilename(title="导入加密包", filetypes=[("Encrypted bundle", "*.enc"), ("All files", "*.*")])
         if not path_text:
             return
-        try:
-            imported = sync_bundle.import_encrypted_bundle(Path(path_text), self.state_dir, self.passphrase_var.get())
+        input_path = Path(path_text)
+        state_dir = self.state_dir
+        passphrase = self.passphrase_var.get()
+
+        def worker(context: TaskContext) -> list[str]:
+            context.report_progress("正在解密并导入...")
+            return sync_bundle.import_encrypted_bundle(input_path, state_dir, passphrase)
+
+        def on_success(imported: list[str]) -> None:
             self.set_status(f"已导入：{', '.join(imported)}", level=StatusLevel.INFO)
             self.refresh_data(rescan=False)
-        except Exception as exc:
-            messagebox.showerror("导入失败", str(exc))
+
+        self._start_background_task(
+            "导入加密包",
+            worker,
+            on_success,
+            busy_text="正在解密并导入...",
+            error_title="导入失败",
+            cancellable=False,
+        )
 
     def upload_bundle(self) -> None:
-        temp_path = self.state_dir / (self.remote_name_var.get().strip() or "offboard-assistant.enc")
-        try:
-            sync_bundle.export_encrypted_bundle(self.state_dir, temp_path, self.passphrase_var.get())
+        state_dir = self.state_dir
+        remote_name = self.remote_name_var.get().strip() or "offboard-assistant.enc"
+        webdav_url = self.webdav_url_var.get().strip()
+        username = self.webdav_user_var.get().strip()
+        password = self.webdav_password_var.get()
+        passphrase = self.passphrase_var.get()
+        temp_path = state_dir / "webdav-upload.enc"
+
+        def worker(context: TaskContext) -> None:
+            context.report_progress("正在生成上传密文...")
+            sync_bundle.export_encrypted_bundle(state_dir, temp_path, passphrase)
+            context.report_progress("正在上传到 WebDAV...")
             sync_bundle.webdav_upload(
-                self.webdav_url_var.get().strip(),
-                self.remote_name_var.get().strip() or "offboard-assistant.enc",
-                self.webdav_user_var.get().strip(),
-                self.webdav_password_var.get(),
+                webdav_url,
+                remote_name,
+                username,
+                password,
                 temp_path,
             )
-            self.save_sync_config()
+            return None
+
+        def on_success(_result: None) -> None:
+            sync_bundle.save_sync_config(
+                state_dir,
+                {"webdav_url": webdav_url, "username": username, "remote_name": remote_name},
+            )
             self.set_status("加密包已上传到 WebDAV。", level=StatusLevel.INFO)
-        except Exception as exc:
-            messagebox.showerror("上传失败", str(exc))
+
+        self._start_background_task(
+            "WebDAV 上传",
+            worker,
+            on_success,
+            busy_text="正在准备 WebDAV 上传...",
+            error_title="上传失败",
+            cancellable=False,
+        )
 
     def download_bundle(self) -> None:
-        temp_path = self.state_dir / (self.remote_name_var.get().strip() or "offboard-assistant.enc")
-        try:
+        state_dir = self.state_dir
+        remote_name = self.remote_name_var.get().strip() or "offboard-assistant.enc"
+        webdav_url = self.webdav_url_var.get().strip()
+        username = self.webdav_user_var.get().strip()
+        password = self.webdav_password_var.get()
+        passphrase = self.passphrase_var.get()
+        temp_path = state_dir / "webdav-download.enc"
+
+        def worker(context: TaskContext) -> list[str]:
+            context.report_progress("正在从 WebDAV 下载...")
             sync_bundle.webdav_download(
-                self.webdav_url_var.get().strip(),
-                self.remote_name_var.get().strip() or "offboard-assistant.enc",
-                self.webdav_user_var.get().strip(),
-                self.webdav_password_var.get(),
+                webdav_url,
+                remote_name,
+                username,
+                password,
                 temp_path,
             )
-            imported = sync_bundle.import_encrypted_bundle(temp_path, self.state_dir, self.passphrase_var.get())
-            self.save_sync_config()
+            context.report_progress("正在解密并导入...")
+            return sync_bundle.import_encrypted_bundle(temp_path, state_dir, passphrase)
+
+        def on_success(imported: list[str]) -> None:
+            sync_bundle.save_sync_config(
+                state_dir,
+                {"webdav_url": webdav_url, "username": username, "remote_name": remote_name},
+            )
             self.set_status(f"已从 WebDAV 下载并导入：{', '.join(imported)}", level=StatusLevel.INFO)
             self.refresh_data(rescan=False)
-        except Exception as exc:
-            messagebox.showerror("下载失败", str(exc))
+
+        self._start_background_task(
+            "WebDAV 下载",
+            worker,
+            on_success,
+            busy_text="正在从 WebDAV 下载...",
+            error_title="下载失败",
+            cancellable=False,
+        )
 
     def open_state_dir(self) -> None:
         try:
@@ -977,15 +1516,53 @@ class OffboardGui(tk.Tk):
         return subprocess.list2cmdline(args)
 
     def run_schtasks(self, args: list[str]) -> None:
-        try:
-            completed = subprocess.run(["schtasks"] + args, capture_output=True, text=True, timeout=30)
-            output = (completed.stdout or "") + (completed.stderr or "")
-            self.bg_output.insert("end", f"> schtasks {' '.join(args)}\n{output}\n")
+        self._run_schtasks_batch([args])
+
+    def _run_schtasks_batch(self, commands: list[list[str]]) -> None:
+        commands = [list(args) for args in commands]
+
+        def worker(context: TaskContext) -> list[dict[str, Any]]:
+            results: list[dict[str, Any]] = []
+            for index, args in enumerate(commands, start=1):
+                context.report_progress({"message": f"正在执行计划任务 ({index}/{len(commands)})", "completed": index - 1, "total": len(commands)})
+                completed = subprocess.run(
+                    ["schtasks"] + args,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                results.append(
+                    {
+                        "args": args,
+                        "output": (completed.stdout or "") + (completed.stderr or ""),
+                        "returncode": completed.returncode,
+                    }
+                )
+            return results
+
+        def on_success(results: list[dict[str, Any]]) -> None:
+            failures: list[str] = []
+            for result in results:
+                args = result["args"]
+                output = result["output"]
+                self.bg_output.insert("end", f"> schtasks {' '.join(args)}\n{output}\n")
+                if result["returncode"] != 0:
+                    failures.append(output or f"Exit code {result['returncode']}")
             self.bg_output.see("end")
-            if completed.returncode != 0:
-                messagebox.showerror("计划任务失败", output or f"Exit code {completed.returncode}")
-        except Exception as exc:
-            messagebox.showerror("计划任务失败", str(exc))
+            if failures:
+                messagebox.showerror("计划任务失败", "\n".join(failures), parent=self)
+                self.set_status("计划任务执行失败。", level=StatusLevel.ERROR)
+            else:
+                self.set_status("计划任务操作已完成。", level=StatusLevel.INFO)
+
+        self._start_background_task(
+            "计划任务操作",
+            worker,
+            on_success,
+            busy_text="正在执行计划任务...",
+            error_title="计划任务失败",
+            cancellable=False,
+        )
 
     def create_watch_task(self) -> None:
         command = self.task_command("--background-watch-install")
@@ -1017,12 +1594,20 @@ class OffboardGui(tk.Tk):
         ])
 
     def delete_background_tasks(self) -> None:
-        self.run_schtasks(["/Delete", "/F", "/TN", "OffboardAssistantInstallWatch"])
-        self.run_schtasks(["/Delete", "/F", "/TN", "OffboardAssistantDailyScan"])
+        self._run_schtasks_batch(
+            [
+                ["/Delete", "/F", "/TN", "OffboardAssistantInstallWatch"],
+                ["/Delete", "/F", "/TN", "OffboardAssistantDailyScan"],
+            ]
+        )
 
     def query_background_tasks(self) -> None:
-        self.run_schtasks(["/Query", "/TN", "OffboardAssistantInstallWatch"])
-        self.run_schtasks(["/Query", "/TN", "OffboardAssistantDailyScan"])
+        self._run_schtasks_batch(
+            [
+                ["/Query", "/TN", "OffboardAssistantInstallWatch"],
+                ["/Query", "/TN", "OffboardAssistantDailyScan"],
+            ]
+        )
 
 
 def describe_item(item: dict[str, Any]) -> tuple[str, str, str]:
