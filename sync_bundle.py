@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,80 @@ SYNC_FILES = {
     "offboarding-report.md",
     "handled-items.json",
 }
+
+
+def _url_origin(url: str) -> tuple[str, str, int | None] | None:
+    """Return the RFC 6454 origin tuple for a URL, or ``None`` if invalid."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        if not scheme or not hostname:
+            return None
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is None:
+        port = {"http": 80, "https": 443}.get(scheme)
+    return scheme, hostname.casefold(), port
+
+
+def _closed_redirect_error(req, fp, code, reason, headers) -> urllib.error.HTTPError:
+    if fp is not None:
+        try:
+            fp.close()
+        except Exception:
+            pass
+    error = urllib.error.HTTPError(req.full_url, code, reason, headers, None)
+    # Python 3.14 wraps a ``None`` fp in a temporary file object internally;
+    # close it before raising so the rejected redirect cannot trigger a
+    # ResourceWarning during exception cleanup.
+    error.close()
+    error.fp = None
+    return error
+
+
+class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Allow redirects only when the request origin stays unchanged.
+
+    urllib's default redirect handler copies arbitrary request headers,
+    including ``Authorization``, to the redirect target.  Refusing a
+    cross-origin redirect prevents credentials from leaving the configured
+    WebDAV endpoint.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        request_origin = _url_origin(req.full_url)
+        redirect_origin = _url_origin(newurl)
+        if request_origin is None or redirect_origin is None or request_origin != redirect_origin:
+            raise _closed_redirect_error(req, fp, code, "Cross-origin redirect blocked", headers)
+        if code not in {301, 302, 303, 307, 308}:
+            raise _closed_redirect_error(req, fp, code, msg, headers)
+        method = req.get_method()
+        if method in {"GET", "HEAD"} or (method == "POST" and code in {301, 302, 303}):
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+        redirected_method = "GET" if code == 303 else method
+        redirected_data = None if code == 303 else req.data
+        excluded_headers = {"content-length", "content-type"} if code == 303 else set()
+        redirected_headers = {
+            key: value
+            for key, value in req.headers.items()
+            if key.lower() not in excluded_headers
+        }
+        return urllib.request.Request(
+            newurl,
+            data=redirected_data,
+            headers=redirected_headers,
+            origin_req_host=req.origin_req_host,
+            unverifiable=True,
+            method=redirected_method,
+        )
+
+
+def _open_url(request: urllib.request.Request, timeout: int):
+    opener = urllib.request.build_opener(_SameOriginRedirectHandler())
+    return opener.open(request, timeout=timeout)
 
 
 class CryptoUnavailable(RuntimeError):
@@ -144,7 +219,7 @@ def webdav_upload(base_url: str, remote_name: str, username: str, password: str,
     auth = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
     request.add_header("Authorization", f"Basic {auth}")
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with _open_url(request, timeout=30) as response:
             if response.status not in {200, 201, 204}:
                 raise RuntimeError(f"Unexpected WebDAV status: {response.status}")
     except urllib.error.URLError as exc:
@@ -156,7 +231,7 @@ def webdav_download(base_url: str, remote_name: str, username: str, password: st
     auth = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
     request.add_header("Authorization", f"Basic {auth}")
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with _open_url(request, timeout=30) as response:
             output_file.parent.mkdir(parents=True, exist_ok=True)
             output_file.write_bytes(response.read())
     except urllib.error.URLError as exc:

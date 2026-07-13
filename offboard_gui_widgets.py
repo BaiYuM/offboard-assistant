@@ -163,14 +163,16 @@ class FirstRunWizard(tk.Toplevel):
             self.destroy()
 
     def _finish(self) -> None:
+        baseline_since = self.date_var.get().strip()
         try:
-            core.parse_since(self.date_var.get().strip())
+            core.parse_since(baseline_since)
         except ValueError:
             messagebox.showerror("日期无效", "请使用 YYYY-MM-DD 格式。", parent=self)
             return
         company = [d.strip() for d in self.company_text.get("1.0", "end").splitlines() if d.strip()]
         personal = [d.strip() for d in self.personal_text.get("1.0", "end").splitlines() if d.strip()]
         config = core.load_local_config(self.state_dir)
+        config["baseline_since"] = baseline_since
         config["scan_roots"] = list(self.scan_roots)
         config["company_email_domains"] = company
         config["personal_email_domains"] = personal

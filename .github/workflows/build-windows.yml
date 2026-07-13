@@ -6,6 +6,9 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -14,12 +17,73 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - name: Install dependencies
-        run: python -m pip install -r requirements-packaging.txt
-      - name: Build EXE
-        run: python -m PyInstaller --noconfirm --windowed --name OffboardAssistant --add-data "README.md;." offboard_gui.py
-      - name: Upload artifact
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Read and validate version
+        id: version
+        shell: pwsh
+        run: |
+          $versionOutput = & python -c "import offboard_assistant as core; print(core.APP_VERSION)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not read offboard_assistant.APP_VERSION."
+          }
+          $version = "$versionOutput".Trim()
+          if ($version -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
+            throw "Invalid offboard_assistant.APP_VERSION: '$version'"
+          }
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $expectedTag = "v$version"
+            if ($env:GITHUB_REF_NAME -ne $expectedTag) {
+              throw "Tag '$env:GITHUB_REF_NAME' must match APP_VERSION '$expectedTag'."
+            }
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Unit tests
+        run: python -m unittest
+
+      - name: Compile check
+        run: python -m py_compile offboard_assistant.py offboard_gui.py offboard_gui_widgets.py ai_reviewer.py sync_bundle.py
+
+      - name: Build release archive
+        shell: pwsh
+        run: .\build_exe.ps1 -SkipInstall
+
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: OffboardAssistant-windows
-          path: dist/OffboardAssistant/
+          name: OffboardAssistant-windows-x64-v${{ steps.version.outputs.version }}
+          path: |
+            release/OffboardAssistant-windows-x64-v${{ steps.version.outputs.version }}.zip
+            release/OffboardAssistant-windows-x64-v${{ steps.version.outputs.version }}.zip.sha256
+          if-no-files-found: error
+
+      - name: Create or update GitHub Release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          $version = "${{ steps.version.outputs.version }}"
+          $tag = $env:GITHUB_REF_NAME
+          $zip = "release/OffboardAssistant-windows-x64-v$version.zip"
+          $hash = "$zip.sha256"
+
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $zip $hash --clobber --repo $env:GITHUB_REPOSITORY
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to update GitHub Release '$tag'."
+            }
+          }
+          else {
+            gh release create $tag $zip $hash --verify-tag --generate-notes `
+              --title "Offboard Assistant $tag" --repo $env:GITHUB_REPOSITORY
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to create GitHub Release '$tag'."
+            }
+          }

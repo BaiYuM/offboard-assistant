@@ -36,6 +36,7 @@ except ImportError:  # pragma: no cover - only available on Windows
 
 APP_DIR = ".offboard-assistant"
 APP_NAME = "OffboardAssistant"
+APP_VERSION = "1.0.1"
 BASELINE_FILE = "baseline.json"
 SNAPSHOT_FILE = "latest-snapshot.json"
 REPORT_FILE = "offboarding-report.md"
@@ -538,7 +539,7 @@ def infer_account_owner_hint(item: dict[str, Any], config: dict[str, Any] | None
     saas_domains = set(rules.saas_domains)
 
     haystacks: list[str] = []
-    for key in ("origin", "path", "title", "name", "app"):
+    for key in ("origin", "path", "title", "name", "app", "username_masked"):
         value = item.get(key)
         if isinstance(value, str) and value:
             haystacks.append(value.lower())
@@ -785,6 +786,10 @@ def ai_review_payload_for_items(
 
 
 def ensure_state_dir(base: Path) -> Path:
+    # Persist absolute paths in quarantine manifests even when callers pass a
+    # relative --state-dir.  Avoid resolve() here so Windows keeps the user's
+    # long-path spelling instead of rewriting it to an 8.3 alias.
+    base = base.expanduser().absolute()
     state_dir = base / APP_DIR
     state_dir.mkdir(parents=True, exist_ok=True)
     return state_dir
@@ -806,7 +811,10 @@ def portable_state_base() -> Path:
     """
     exe = getattr(sys, "executable", None)
     if exe:
-        parent = Path(exe).resolve().parent
+        # ``resolve()`` can rewrite Windows temp paths to their 8.3 alias,
+        # which makes the portable directory appear to move.  ``absolute()``
+        # keeps the executable's spelling while still handling relative paths.
+        parent = Path(exe).absolute().parent
     else:
         parent = Path.cwd()
     return parent / ".offboard_data"
@@ -828,6 +836,10 @@ CONFIG_FILE = "config.json"
 WIZARD_DONE_FILE = "wizard.done"
 DEFAULT_CONFIG: dict[str, Any] = {
     "schema_version": 1,
+    # The wizard stores the user's intended baseline date here so the GUI can
+    # restore the field on the next launch.  Keep the empty value for
+    # backwards-compatible loading of existing config files.
+    "baseline_since": "",
     "scan_roots": [],
     "excluded_paths": [],
     "company_email_domains": [],
@@ -1479,11 +1491,11 @@ def scan_browser_logins(state_dir: Path) -> list[dict[str, Any]]:
 def default_scan_roots() -> list[Path]:
     home = Path.home()
     roots = [Path.cwd()]
-    for name in DEFAULT_SCAN_DIR_NAMES:
+    for name in sorted(DEFAULT_SCAN_DIR_NAMES):
         candidate = home / name
         if candidate.exists():
             roots.append(candidate)
-    for name in AI_APP_CONFIG_DIR_NAMES:
+    for name in sorted(AI_APP_CONFIG_DIR_NAMES):
         candidate = home / name
         if candidate.exists():
             roots.append(candidate)
@@ -1582,9 +1594,30 @@ def detect_secret_references(path: Path, max_bytes: int = 2 * 1024 * 1024, state
     return findings
 
 
-def scan_sensitive_locations(roots: list[Path], max_files: int = 20000, state_dir: Path | None = None) -> list[dict[str, Any]]:
+def scan_sensitive_locations(
+    roots: list[Path],
+    max_files: int = 20000,
+    state_dir: Path | None = None,
+    config: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     found: list[dict[str, Any]] = []
     visited = 0
+    excluded_paths: list[Path] = []
+    for value in (config or {}).get("excluded_paths", []):
+        if not isinstance(value, str) or not value.strip():
+            continue
+        try:
+            excluded_paths.append(Path(value).expanduser().resolve(strict=False))
+        except (OSError, RuntimeError):
+            continue
+
+    def is_excluded(path: Path) -> bool:
+        try:
+            candidate = path.resolve(strict=False)
+        except (OSError, RuntimeError):
+            return False
+        return any(candidate == excluded or excluded in candidate.parents for excluded in excluded_paths)
+
     ignored_dirs = {
         ".git",
         ".svn",
@@ -1597,21 +1630,28 @@ def scan_sensitive_locations(roots: list[Path], max_files: int = 20000, state_di
         "Program Files",
         "Program Files (x86)",
     }
+    limit_reached = False
     for root in roots:
-        if not root.exists():
+        if not root.exists() or is_excluded(root):
             continue
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [name for name in dirnames if name not in ignored_dirs]
-            visited += len(filenames)
-            if visited > max_files:
-                break
-            for filename in filenames:
-                path = Path(dirpath) / filename
+            current_dir = Path(dirpath)
+            dirnames[:] = sorted(
+                name
+                for name in dirnames
+                if name not in ignored_dirs and not is_excluded(current_dir / name)
+            )
+            for filename in sorted(filenames):
+                if visited >= max_files:
+                    limit_reached = True
+                    break
+                visited += 1
+                path = current_dir / filename
                 if not is_sensitive_name(path) and not should_scan_file_contents(path):
                     continue
                 secret_findings = detect_secret_references(path, state_dir=state_dir) if should_scan_file_contents(path) else []
                 path_text = safe_rel(path)
-                category = categorize_path(path_text, state_dir=state_dir)
+                category = categorize_path(path_text, config=config, state_dir=state_dir)
                 if secret_findings:
                     category = dict(category)
                     category["recommendation"] = "prioritize_revoke_then_clean"
@@ -1628,7 +1668,9 @@ def scan_sensitive_locations(roots: list[Path], max_files: int = 20000, state_di
                         **category,
                     }
                 )
-        if visited > max_files:
+            if limit_reached:
+                break
+        if limit_reached:
             break
     return found
 
@@ -1787,7 +1829,27 @@ def _jetbrains_time_to_iso(value: str | None) -> str | None:
         return None
 
 
-def collect_snapshot(state_dir: Path, roots: list[Path]) -> dict[str, Any]:
+def collect_snapshot(
+    state_dir: Path,
+    roots: list[Path],
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    effective_config = config if config is not None else load_local_config(state_dir)
+    items = (
+        scan_environment()
+        + scan_installed_apps_from_registry()
+        + scan_browser_logins(state_dir)
+        + scan_sensitive_locations(roots, state_dir=state_dir, config=effective_config)
+        + scan_chat_locations()
+    )
+    if effective_config.get("ide_scan_enabled", True):
+        items.extend(scan_recent_ide_projects())
+    for item in items:
+        item["account_owner_hint"] = infer_account_owner_hint(
+            item,
+            effective_config,
+            state_dir=state_dir,
+        )
     return {
         "schema_version": 1,
         "generated_at": utc_now(),
@@ -1802,14 +1864,7 @@ def collect_snapshot(state_dir: Path, roots: list[Path]) -> dict[str, Any]:
             "chat_contents_recorded": False,
             "ide_recent_project_contents_recorded": False,
         },
-        "items": (
-            scan_environment()
-            + scan_installed_apps_from_registry()
-            + scan_browser_logins(state_dir)
-            + scan_sensitive_locations(roots, state_dir=state_dir)
-            + scan_chat_locations()
-            + scan_recent_ide_projects()
-        ),
+        "items": items,
     }
 
 
@@ -1981,7 +2036,7 @@ def command_init(args: argparse.Namespace) -> int:
     state_dir = state_dir_from_arg(args.state_dir, portable=bool(getattr(args, "portable", False)))
     config = _load_config_for_args(args, state_dir)
     roots = resolve_scan_roots(args.scan_root, config)
-    snapshot = collect_snapshot(state_dir, roots)
+    snapshot = collect_snapshot(state_dir, roots, config=config)
     baseline_path = state_dir / BASELINE_FILE
     if baseline_path.exists() and not args.force:
         print(f"Baseline already exists: {baseline_path}")
@@ -1999,7 +2054,7 @@ def command_scan(args: argparse.Namespace) -> int:
     state_dir = state_dir_from_arg(args.state_dir, portable=bool(getattr(args, "portable", False)))
     config = _load_config_for_args(args, state_dir)
     roots = resolve_scan_roots(args.scan_root, config)
-    snapshot = collect_snapshot(state_dir, roots)
+    snapshot = collect_snapshot(state_dir, roots, config=config)
     snapshot_path = state_dir / SNAPSHOT_FILE
     write_json(snapshot_path, snapshot)
     print(f"Snapshot written: {snapshot_path}")
@@ -2019,14 +2074,14 @@ def command_report(args: argparse.Namespace) -> int:
     config = _load_config_for_args(args, state_dir)
     roots = resolve_scan_roots(args.scan_root, config)
     if args.rescan:
-        snapshot = collect_snapshot(state_dir, roots)
+        snapshot = collect_snapshot(state_dir, roots, config=config)
         write_json(state_dir / SNAPSHOT_FILE, snapshot)
     else:
         snapshot_path = state_dir / SNAPSHOT_FILE
         if snapshot_path.exists():
             snapshot = read_json(snapshot_path)
         else:
-            snapshot = collect_snapshot(state_dir, roots)
+            snapshot = collect_snapshot(state_dir, roots, config=config)
             write_json(snapshot_path, snapshot)
 
     since = parse_since(args.since or baseline.get("baseline_since") or baseline.get("generated_at"))
@@ -2057,7 +2112,7 @@ def load_candidates_for_state(state_dir: Path, since_override: str | None, resca
     snapshot_path = state_dir / SNAPSHOT_FILE
     if rescan or not snapshot_path.exists():
         roots = resolve_scan_roots(scan_roots, config or {})
-        snapshot = collect_snapshot(state_dir, roots)
+        snapshot = collect_snapshot(state_dir, roots, config=config)
         write_json(snapshot_path, snapshot)
     else:
         snapshot = read_json(snapshot_path)
@@ -2130,12 +2185,17 @@ def list_quarantine_bundles(state_dir: Path) -> list[dict[str, Any]]:
         except (OSError, ValueError):
             bundles.append({"directory": str(child), "ts": child.name, "items": [], "errors": ["manifest_unreadable"]})
             continue
+        if not isinstance(data, dict):
+            bundles.append({"directory": str(child), "ts": child.name, "items": [], "errors": ["manifest_invalid_shape"]})
+            continue
+        items = data.get("items", [])
+        errors = data.get("errors", [])
         bundles.append(
             {
                 "directory": str(child),
                 "ts": child.name,
-                "items": data.get("items", []),
-                "errors": data.get("errors", []),
+                "items": items if isinstance(items, list) else [],
+                "errors": errors if isinstance(errors, list) else [],
             }
         )
     return bundles
@@ -2191,6 +2251,34 @@ def _ensure_quarantine_index(state_dir: Path) -> "sqlite3.Connection | None":
         return None
 
 
+def _quarantine_path_size(path: Path) -> int:
+    """Return the logical bytes stored at an indexed quarantine destination."""
+    try:
+        if path.is_symlink() or path.is_file():
+            return path.lstat().st_size
+        if not path.is_dir():
+            return 0
+    except OSError:
+        return 0
+
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
+        directory = Path(dirpath)
+        for name in filenames:
+            try:
+                total += (directory / name).lstat().st_size
+            except OSError:
+                continue
+        for name in dirnames:
+            child = directory / name
+            try:
+                if child.is_symlink():
+                    total += child.lstat().st_size
+            except OSError:
+                continue
+    return total
+
+
 def _index_quarantine_batch(state_dir: Path, batch_dir: Path, manifest: dict[str, Any]) -> None:
     """Mirror a freshly written manifest into the SQLite index.
 
@@ -2202,13 +2290,27 @@ def _index_quarantine_batch(state_dir: Path, batch_dir: Path, manifest: dict[str
         return
     try:
         batch_id = batch_dir.name
-        items = manifest.get("items", []) or []
+        raw_items = manifest.get("items", []) or []
+        items = [row for row in raw_items if isinstance(row, dict)] if isinstance(raw_items, list) else []
         source_bytes = 0
+        try:
+            resolved_batch = batch_dir.resolve()
+        except (OSError, RuntimeError):
+            resolved_batch = None
         for row in items:
+            destination_value = row.get("destination")
+            if not isinstance(destination_value, str) or not destination_value.strip():
+                continue
             try:
-                source_bytes += Path(row.get("source", "")).stat().st_size if row.get("source") and Path(row.get("source", "")).exists() else 0
-            except OSError:
-                pass
+                destination = Path(destination_value)
+                resolved_destination = destination.resolve()
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if resolved_batch is None or resolved_destination == resolved_batch:
+                continue
+            if not resolved_destination.is_relative_to(resolved_batch):
+                continue
+            source_bytes += _quarantine_path_size(destination)
         tags = ""
         conn.execute(
             "INSERT OR REPLACE INTO batches (batch_id, created_at, source_count, source_bytes, tags, restored_count) VALUES (?, ?, ?, ?, ?, 0)",
@@ -2297,6 +2399,31 @@ def _bump_quarantine_index_restored(state_dir: Path, batch_id: str, restored_cou
             pass
 
 
+def _remove_quarantine_index_batch(state_dir: Path, batch_id: str) -> None:
+    """Remove a purged batch from an existing index without creating one."""
+    index_path = _quarantine_index_path(state_dir)
+    if not index_path.is_file():
+        return
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(str(index_path))
+        conn.execute("DELETE FROM items WHERE batch_id = ?", (batch_id,))
+        conn.execute("DELETE FROM batches WHERE batch_id = ?", (batch_id,))
+        conn.commit()
+    except sqlite3.Error:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+
 def restore_quarantine_dir(quarantine_dir: Path) -> dict[str, Any]:
     """Reverse `quarantine_selected_recommended` by reading manifest.json and
     moving each entry back to its original path. Skips (does not overwrite)
@@ -2307,11 +2434,52 @@ def restore_quarantine_dir(quarantine_dir: Path) -> dict[str, Any]:
         raise FileNotFoundError(f"Missing manifest: {manifest_path}")
     manifest = read_json(manifest_path)
     result: dict[str, Any] = {"restored": [], "skipped": [], "errors": []}
-    for row in manifest.get("items", []):
-        destination = Path(row.get("destination", ""))
-        source = Path(row.get("source", ""))
-        if not source or not destination:
-            result["errors"].append(f"manifest row missing paths: {row}")
+    if not isinstance(manifest, dict):
+        result["errors"].append("manifest must be a JSON object")
+        return result
+    items = manifest.get("items", [])
+    if not isinstance(items, list):
+        result["errors"].append("manifest items must be a list")
+        return result
+    try:
+        resolved_batch = quarantine_dir.resolve()
+        resolved_manifest = manifest_path.resolve()
+    except (OSError, RuntimeError) as exc:
+        result["errors"].append(f"could not resolve quarantine paths: {exc}")
+        return result
+
+    for index, row in enumerate(items):
+        error_prefix = f"manifest item {index}"
+        if not isinstance(row, dict):
+            result["errors"].append(f"{error_prefix}: item must be an object")
+            continue
+        source_value = row.get("source")
+        destination_value = row.get("destination")
+        if not isinstance(source_value, str) or not source_value.strip():
+            result["errors"].append(f"{error_prefix}: source must be a non-empty string")
+            continue
+        if not isinstance(destination_value, str) or not destination_value.strip():
+            result["errors"].append(f"{error_prefix}: destination must be a non-empty string")
+            continue
+        source = Path(source_value)
+        destination = Path(destination_value)
+        if not source.is_absolute() or not destination.is_absolute():
+            result["errors"].append(f"{error_prefix}: source and destination must be absolute paths")
+            continue
+        try:
+            resolved_source = source.resolve()
+            resolved_destination = destination.resolve()
+        except (OSError, RuntimeError, ValueError) as exc:
+            result["errors"].append(f"{error_prefix}: invalid path: {exc}")
+            continue
+        if resolved_destination == resolved_batch or not resolved_destination.is_relative_to(resolved_batch):
+            result["errors"].append(f"{error_prefix}: destination must be inside the quarantine batch")
+            continue
+        if resolved_destination == resolved_manifest:
+            result["errors"].append(f"{error_prefix}: destination cannot be the manifest")
+            continue
+        if resolved_source.is_relative_to(resolved_batch):
+            result["errors"].append(f"{error_prefix}: source cannot be inside the quarantine batch")
             continue
         if not destination.exists():
             result["errors"].append(f"quarantined file missing: {destination}")
@@ -2338,8 +2506,22 @@ def purge_quarantine_dir(quarantine_dir: Path) -> dict[str, Any]:
     """Permanently delete a quarantine bundle (the moved files plus its manifest)."""
     if not quarantine_dir.exists():
         return {"purged": False, "errors": [f"not found: {quarantine_dir}"]}
+    index_entry: tuple[Path, str] | None = None
+    try:
+        resolved_batch = quarantine_dir.resolve()
+        resolved_quarantine_root = quarantine_dir.parent.resolve()
+        if (
+            quarantine_dir.parent.name == "quarantine"
+            and resolved_batch.parent == resolved_quarantine_root
+            and resolved_batch != resolved_quarantine_root
+        ):
+            index_entry = (resolved_quarantine_root.parent, quarantine_dir.name)
+    except (OSError, RuntimeError):
+        pass
     try:
         shutil.rmtree(quarantine_dir)
+        if index_entry is not None:
+            _remove_quarantine_index_batch(*index_entry)
         return {"purged": True, "errors": []}
     except OSError as exc:
         return {"purged": False, "errors": [str(exc)]}
@@ -2654,6 +2836,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Track post-onboarding install/login/config residue without storing secrets."
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
     parser.add_argument(
         "--state-dir",
         help="Directory that contains the .offboard-assistant state folder. Default: %%APPDATA%%\\OffboardAssistant.",

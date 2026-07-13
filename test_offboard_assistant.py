@@ -569,8 +569,10 @@ class OffboardAssistantTests(unittest.TestCase):
             # integration path. ``scan_browser_logins`` in particular touches
             # real Chromium databases and creates temp sqlite files whose
             # cleanup races with Windows file locking in CI.
+            recent_items = oa.scan_recent_ide_projects(custom_roots=[root])
             with mock.patch.object(oa, "scan_browser_logins", return_value=[]), \
-                 mock.patch.object(oa, "scan_installed_apps_from_registry", return_value=[]):
+                 mock.patch.object(oa, "scan_installed_apps_from_registry", return_value=[]), \
+                 mock.patch.object(oa, "scan_recent_ide_projects", return_value=recent_items):
                 snapshot = oa.collect_snapshot(Path(tmp) / "state", roots=[root])
             ide_items = [it for it in snapshot["items"] if it.get("type") == "ide_recent_project"]
             self.assertGreaterEqual(len(ide_items), 1)
@@ -583,10 +585,12 @@ class OffboardAssistantTests(unittest.TestCase):
             state_dir = Path(tmp) / "state"
             state_dir.mkdir()
             config = oa.default_config()
+            config["baseline_since"] = "2026-07-06"
             config["company_email_domains"] = ["@mycorp.example.com"]
             config["scan_roots"] = [str(Path(tmp) / "scan")]
             oa.save_local_config(state_dir, config)
             loaded = oa.load_local_config(state_dir)
+            self.assertEqual(loaded["baseline_since"], "2026-07-06")
             self.assertEqual(loaded["company_email_domains"], ["@mycorp.example.com"])
             self.assertEqual(loaded["scan_roots"], [str(Path(tmp) / "scan")])
             # Default keys should still be present.
@@ -597,6 +601,7 @@ class OffboardAssistantTests(unittest.TestCase):
         from pathlib import Path
         cfg = oa.load_local_config(Path(tempfile.gettempdir()) / "nonexistent-offboard-state")
         self.assertEqual(cfg["schema_version"], 1)
+        self.assertEqual(cfg["baseline_since"], "")
         self.assertEqual(cfg["company_email_domains"], [])
 
     def test_local_config_silently_drops_unknown_keys(self):
@@ -612,6 +617,51 @@ class OffboardAssistantTests(unittest.TestCase):
             cfg = oa.load_local_config(state_dir)
             self.assertEqual(cfg["company_email_domains"], ["@x"])
             self.assertNotIn("rogue_key", cfg)
+
+    def test_first_run_wizard_persists_baseline_date_and_scan_roots(self):
+        import importlib
+        from types import SimpleNamespace
+        from unittest import mock
+
+        widgets = importlib.import_module("offboard_gui_widgets")
+
+        class _Value:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self, *_args):
+                return self.value
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            state_dir.mkdir()
+            scan_root = Path(tmp) / "work"
+            wizard = SimpleNamespace(
+                date_var=_Value("2026-07-06"),
+                company_text=_Value("@corp.example"),
+                personal_text=_Value("@personal.example"),
+                state_dir=state_dir,
+                scan_roots=[str(scan_root)],
+                destroy=mock.Mock(),
+            )
+            with mock.patch.object(widgets.messagebox, "showinfo"):
+                widgets.FirstRunWizard._finish(wizard)
+
+            config = oa.load_local_config(state_dir)
+            self.assertEqual(config["baseline_since"], "2026-07-06")
+            self.assertEqual(config["scan_roots"], [str(scan_root)])
+            self.assertEqual(config["company_email_domains"], ["@corp.example"])
+            self.assertTrue(oa.is_wizard_done(state_dir))
+
+    def test_gui_baseline_field_reads_config_and_handles_legacy_values(self):
+        import importlib
+        from types import SimpleNamespace
+
+        gui = importlib.import_module("offboard_gui")
+        app = SimpleNamespace(local_config={"baseline_since": "2026-07-06"})
+        self.assertEqual(gui.OffboardGui._configured_baseline_since(app), "2026-07-06")
+        app.local_config = {"baseline_since": "not-a-date"}
+        self.assertEqual(gui.OffboardGui._configured_baseline_since(app), dt.date.today().isoformat())
 
     def test_wizard_done_roundtrip(self):
         import tempfile
@@ -721,6 +771,67 @@ class OffboardAssistantTests(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 oa.restore_quarantine_dir(bundle)
 
+    def test_restore_quarantine_rejects_malicious_manifest_entries(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = root / "quarantine" / "20260701-malicious"
+            bundle.mkdir(parents=True)
+            outside = root / "outside.txt"
+            outside.write_text("outside", encoding="utf-8")
+            moved = bundle / "moved.txt"
+            moved.write_text("moved", encoding="utf-8")
+            manifest_path = bundle / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "items": [
+                            "not-an-object",
+                            {"source": "", "destination": str(moved)},
+                            {"source": 123, "destination": str(moved)},
+                            {"source": str(root / "target-a"), "destination": None},
+                            {"source": "relative-source", "destination": str(moved)},
+                            {"source": str(root / "target-b"), "destination": "relative-destination"},
+                            {"source": str(root / "target-c"), "destination": str(outside)},
+                            {"source": str(root / "target-d"), "destination": str(manifest_path)},
+                            {"source": str(bundle / "restore-target.txt"), "destination": str(moved)},
+                            {"source": str(root / "target-e"), "destination": str(bundle)},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = oa.restore_quarantine_dir(bundle)
+
+            self.assertEqual(result["restored"], [])
+            self.assertEqual(result["skipped"], [])
+            errors = "\n".join(result["errors"])
+            self.assertIn("item must be an object", errors)
+            self.assertIn("source must be a non-empty string", errors)
+            self.assertIn("destination must be a non-empty string", errors)
+            self.assertIn("source and destination must be absolute paths", errors)
+            self.assertIn("destination must be inside the quarantine batch", errors)
+            self.assertIn("destination cannot be the manifest", errors)
+            self.assertIn("source cannot be inside the quarantine batch", errors)
+            self.assertEqual(outside.read_text(encoding="utf-8"), "outside")
+            self.assertEqual(moved.read_text(encoding="utf-8"), "moved")
+            self.assertTrue(manifest_path.exists())
+
+    def test_restore_quarantine_rejects_non_object_manifest(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp) / "quarantine" / "20260701-invalid"
+            bundle.mkdir(parents=True)
+            (bundle / "manifest.json").write_text("[]", encoding="utf-8")
+            result = oa.restore_quarantine_dir(bundle)
+            self.assertEqual(result["restored"], [])
+            self.assertEqual(result["errors"], ["manifest must be a JSON object"])
+
     def test_purge_quarantine_removes_bundle(self):
         import tempfile
         from pathlib import Path
@@ -743,11 +854,15 @@ class OffboardAssistantTests(unittest.TestCase):
             bad = state_dir / "quarantine" / "20260702"
             bad.mkdir(parents=True)
             (bad / "manifest.json").write_text("not json", encoding="utf-8")
+            malformed = state_dir / "quarantine" / "20260703"
+            malformed.mkdir(parents=True)
+            (malformed / "manifest.json").write_text("[]", encoding="utf-8")
             bundles = oa.list_quarantine_bundles(state_dir)
-            self.assertEqual(len(bundles), 2)
+            self.assertEqual(len(bundles), 3)
             ts_to_bundle = {b["ts"]: b for b in bundles}
             self.assertEqual(ts_to_bundle["20260701"]["items"], [])
             self.assertIn("manifest_unreadable", ts_to_bundle["20260702"]["errors"])
+            self.assertIn("manifest_invalid_shape", ts_to_bundle["20260703"]["errors"])
 
     def test_quarantine_index_records_and_lists_batches(self):
         import sqlite3
@@ -789,6 +904,77 @@ class OffboardAssistantTests(unittest.TestCase):
             items = conn.execute("SELECT item_id, source, destination, category FROM items").fetchall()
             conn.close()
             self.assertEqual(items, [("x", str(source), str(moved), "codex_temp_plugin_cache")])
+
+    def test_quarantine_index_counts_destination_file_and_directory_bytes(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            bundle = state_dir / "quarantine" / "20260801-120000"
+            nested = bundle / "002-directory" / "nested"
+            nested.mkdir(parents=True)
+            moved_file = bundle / "001-file.bin"
+            moved_file.write_bytes(b"12345")
+            (bundle / "002-directory" / "root.bin").write_bytes(b"abcdef")
+            (nested / "leaf.bin").write_bytes(b"xyz")
+            manifest = {
+                "items": [
+                    {
+                        "item_id": "file",
+                        "source": str(state_dir / "missing-file.bin"),
+                        "destination": str(moved_file),
+                    },
+                    {
+                        "item_id": "directory",
+                        "source": str(state_dir / "missing-directory"),
+                        "destination": str(bundle / "002-directory"),
+                    },
+                ]
+            }
+
+            oa._index_quarantine_batch(state_dir, bundle, manifest)
+
+            rows = oa.query_quarantine_index(state_dir)
+            self.assertEqual(rows[0]["source_count"], 2)
+            self.assertEqual(rows[0]["source_bytes"], 5 + 6 + 3)
+
+    def test_purge_quarantine_removes_batch_from_index(self):
+        import sqlite3
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            bundle = state_dir / "quarantine" / "20260801-130000"
+            bundle.mkdir(parents=True)
+            moved = bundle / "001-file.txt"
+            moved.write_text("payload", encoding="utf-8")
+            manifest = {
+                "items": [
+                    {
+                        "item_id": "x",
+                        "source": str(state_dir / "missing.txt"),
+                        "destination": str(moved),
+                    }
+                ]
+            }
+            oa._index_quarantine_batch(state_dir, bundle, manifest)
+            self.assertEqual(len(oa.query_quarantine_index(state_dir)), 1)
+
+            result = oa.purge_quarantine_dir(bundle)
+
+            self.assertTrue(result["purged"])
+            self.assertFalse(bundle.exists())
+            self.assertEqual(oa.query_quarantine_index(state_dir), [])
+            conn = sqlite3.connect(str(state_dir / oa.QUARANTINE_INDEX_FILE))
+            try:
+                batch_count = conn.execute("SELECT COUNT(*) FROM batches").fetchone()[0]
+                item_count = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(batch_count, 0)
+            self.assertEqual(item_count, 0)
 
     def test_quarantine_index_silent_on_filesystem_error(self):
         """A bad state_dir path must not raise; just return []."""
@@ -1085,6 +1271,136 @@ class PortableModeTests(unittest.TestCase):
             self.assertEqual(len(a.path_rules), len(b.path_rules))
 
 
+class AuthorizationRedirectTests(unittest.TestCase):
+    def test_handlers_allow_same_origin_redirects(self):
+        import urllib.request
+
+        for module in (ai_reviewer, sync_bundle):
+            with self.subTest(module=module.__name__):
+                request = urllib.request.Request("https://api.example.test/start")
+                request.add_header("Authorization", "Bearer top-secret")
+                redirected = module._SameOriginRedirectHandler().redirect_request(
+                    request,
+                    None,
+                    302,
+                    "Found",
+                    {},
+                    "https://API.EXAMPLE.TEST:443/next",
+                )
+                self.assertEqual(redirected.full_url, "https://API.EXAMPLE.TEST:443/next")
+                self.assertEqual(redirected.get_header("Authorization"), "Bearer top-secret")
+
+    def test_handlers_preserve_same_origin_write_requests(self):
+        import urllib.request
+
+        cases = (("POST", 307), ("PUT", 308), ("PUT", 301))
+        for module in (ai_reviewer, sync_bundle):
+            for method, status in cases:
+                with self.subTest(module=module.__name__, method=method, status=status):
+                    request = urllib.request.Request(
+                        "https://api.example.test/start",
+                        data=b"request-body",
+                        method=method,
+                    )
+                    request.add_header("Content-Type", "application/json")
+                    request.add_header("Authorization", "Bearer top-secret")
+                    redirected = module._SameOriginRedirectHandler().redirect_request(
+                        request,
+                        None,
+                        status,
+                        "Redirect",
+                        {},
+                        "https://api.example.test/next",
+                    )
+                    self.assertEqual(redirected.get_method(), method)
+                    self.assertEqual(redirected.data, b"request-body")
+                    self.assertEqual(redirected.get_header("Authorization"), "Bearer top-secret")
+
+    def test_handlers_block_cross_origin_redirects(self):
+        import urllib.error
+        import urllib.request
+
+        class RedirectResponse:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        targets = (
+            "https://other.example.test/next",
+            "http://api.example.test/next",
+            "https://api.example.test:444/next",
+        )
+        for module in (ai_reviewer, sync_bundle):
+            for target in targets:
+                with self.subTest(module=module.__name__, target=target):
+                    request = urllib.request.Request("https://api.example.test/start")
+                    request.add_header("Authorization", "Bearer top-secret")
+                    response = RedirectResponse()
+                    with self.assertRaisesRegex(urllib.error.HTTPError, "Cross-origin redirect blocked") as raised:
+                        module._SameOriginRedirectHandler().redirect_request(
+                            request,
+                            response,
+                            302,
+                            "Found",
+                            {},
+                            target,
+                        )
+                    self.assertTrue(response.closed)
+                    self.assertIsNone(raised.exception.fp)
+
+    def test_handlers_close_unsupported_redirect_responses(self):
+        import urllib.error
+        import urllib.request
+
+        class RedirectResponse:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        for module in (ai_reviewer, sync_bundle):
+            with self.subTest(module=module.__name__):
+                request = urllib.request.Request("https://api.example.test/start")
+                response = RedirectResponse()
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    module._SameOriginRedirectHandler().redirect_request(
+                        request,
+                        response,
+                        399,
+                        "Unsupported redirect",
+                        {},
+                        "https://api.example.test/next",
+                    )
+                self.assertTrue(response.closed)
+                self.assertIsNone(raised.exception.fp)
+
+    def test_clients_install_the_protected_redirect_handler(self):
+        import urllib.request
+        from unittest import mock
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+        for module in (ai_reviewer, sync_bundle):
+            with self.subTest(module=module.__name__):
+                opener = mock.Mock()
+                opener.open.return_value = Response()
+                with mock.patch.object(module.urllib.request, "build_opener", return_value=opener) as build_opener:
+                    request = urllib.request.Request("https://api.example.test/start")
+                    with module._open_url(request, timeout=17):
+                        pass
+                handler = build_opener.call_args.args[0]
+                self.assertIsInstance(handler, module._SameOriginRedirectHandler)
+                opener.open.assert_called_once_with(request, timeout=17)
+
+
 class RenderTreeDetailPanelTests(unittest.TestCase):
     """Regression: detail panel must persist across render_tree() calls.
 
@@ -1102,6 +1418,33 @@ class RenderTreeDetailPanelTests(unittest.TestCase):
         # Stub the FirstRunWizard prompt so init doesn't block on a modal.
         gui.FirstRunWizard = MagicMock()
         return gui.OffboardGui(None), widgets
+
+    def test_render_tree_selects_first_visible_item_by_default(self):
+        import tempfile
+        from pathlib import Path
+        import json
+        import tkinter as tk
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            state_dir.mkdir(parents=True)
+            (state_dir / "baseline.json").write_text(
+                json.dumps({"baseline_since": "2020-01-01", "items": []})
+            )
+            (state_dir / "latest-snapshot.json").write_text(
+                json.dumps({"items": [{"id": "a", "type": "ide_recent_project", "name": "alpha", "path": "/x", "modified_at": "2026-07-06T00:00:00+00:00"}]})
+            )
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                gui_obj, _widgets = self._build_gui(root)
+                gui_obj.state_dir = state_dir
+                gui_obj.refresh_data(rescan=False)
+                self.assertIsNot(gui_obj.tree.master, gui_obj.dashboard)
+                self.assertEqual(gui_obj.tree.focus(), "a")
+                text_after_load = gui_obj.detail_panel.text.get("1.0", "end")
+                self.assertIn("alpha", text_after_load)
+            finally:
+                root.destroy()
 
     def test_render_tree_preserves_focus_and_detail_panel(self):
         import tempfile

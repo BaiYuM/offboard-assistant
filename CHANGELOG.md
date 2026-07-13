@@ -1,8 +1,51 @@
 # Changelog
 
 All notable changes to Offboard Assistant are documented here. The format is
-loosely based on [Keep a Changelog](https://keepachangelog.com) and the
-project does not yet follow Semantic Versioning (no public releases tagged).
+loosely based on [Keep a Changelog](https://keepachangelog.com), and tagged
+releases follow Semantic Versioning.
+
+## [1.0.1] - 2026-07-13
+
+### Security
+
+- Blocked AI API and WebDAV redirects that would send authorization headers to
+  a different scheme, host, or port. Same-origin redirects remain supported.
+- Hardened quarantine restore manifests: paths must be absolute, quarantined
+  sources must remain inside their batch, and malformed or traversal entries
+  are rejected before any move.
+
+### Fixed
+
+- Connected the first-run wizard to actual scanning. Its baseline date and scan
+  roots now persist, reload immediately, and are used by GUI baseline/rescan
+  actions.
+- Applied local `excluded_paths`, `ide_scan_enabled`, and account-domain hints
+  throughout snapshot collection. File caps now stop deterministically across
+  all roots instead of skipping an entire final directory.
+- Preserved the selected detail row across list refreshes, selected the first
+  visible candidate on initial load, and added a visible filtered/total count.
+- Kept portable state paths in the executable's original Windows path spelling,
+  avoiding CI and runtime mismatches caused by 8.3 path canonicalization.
+- Corrected quarantine byte statistics to inspect moved destinations and remove
+  purged batches from the SQLite history index.
+- Fixed the PowerShell build script's invalid `param` placement and removed the
+  obsolete PyInstaller bytecode-encryption option.
+
+### Changed
+
+- Added `APP_VERSION` plus CLI/GUI `--version` reporting and window-title
+  version display.
+- Windows builds now contain `README.md` and `rules/default.yaml`, produce a
+  complete one-dir ZIP plus SHA-256 checksum, and verify required files before
+  packaging.
+- Tag builds validate `v<APP_VERSION>`, run tests and compile checks, and create
+  or update the matching GitHub Release automatically.
+
+### Tests
+
+- Added redirect-origin, wizard persistence, scan configuration, quarantine
+  manifest, package metadata, and Windows portable-path regression coverage.
+- Removed environment-dependent IDE integration assumptions from Windows CI.
 
 <!-- CI-MARKER: phase1-complete -->
 

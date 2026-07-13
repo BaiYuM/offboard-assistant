@@ -30,7 +30,7 @@ from offboard_gui_widgets import (
 class OffboardGui(tk.Tk):
     def __init__(self, state_base: Path | None) -> None:
         super().__init__()
-        self.title("Offboard Assistant")
+        self.title(f"Offboard Assistant {core.APP_VERSION}")
         self.geometry("1180x760")
         self.minsize(980, 620)
         self.state_base = state_base or (
@@ -50,6 +50,30 @@ class OffboardGui(tk.Tk):
         # First-run detection: no baseline AND no wizard.done marker.
         if not core.is_wizard_done(self.state_dir) and not (self.state_dir / core.BASELINE_FILE).exists():
             FirstRunWizard(self, self.state_dir).show()
+            # The modal wizard writes local config before returning. Reload it
+            # so its date/domains/scan roots are immediately reflected in the
+            # main window without requiring a second launch.
+            self.local_config = core.load_local_config(self.state_dir)
+            self.baseline_since_var.set(self._configured_baseline_since())
+
+    def _configured_baseline_since(self) -> str:
+        """Return a date suitable for the baseline entry widget.
+
+        Older config files do not have ``baseline_since``; use today's date
+        in that case. Invalid values are ignored rather than preventing the
+        GUI from starting.
+        """
+        raw = str(self.local_config.get("baseline_since") or "").strip()
+        if raw:
+            try:
+                # Preserve the calendar day for date-only input. ``parse_since``
+                # normalizes timezone-aware values, which can otherwise move a
+                # date-only value to the previous day in UTC+ timezones.
+                core.parse_since(raw)
+                return raw[:10]
+            except (TypeError, ValueError):
+                pass
+        return dt.date.today().isoformat()
 
     def _build_layout(self) -> None:
         self.columnconfigure(0, weight=1)
@@ -101,7 +125,7 @@ class OffboardGui(tk.Tk):
         self.dashboard.rowconfigure(1, weight=1)
 
         toolbar = ttk.Frame(self.dashboard)
-        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        toolbar.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8))
 
         # Toolbar split into 3 groups of escalating severity. Low-risk browse
         # actions stay on the visible toolbar; write/delete actions live in an
@@ -126,7 +150,7 @@ class OffboardGui(tk.Tk):
         baseline_group = ttk.Frame(toolbar)
         baseline_group.pack(side="left", padx=(0, 6))
         ttk.Label(baseline_group, text="基线日期").pack(side="left", padx=(0, 4))
-        self.baseline_since_var = tk.StringVar(value="2026-03-15")
+        self.baseline_since_var = tk.StringVar(value=self._configured_baseline_since())
         ttk.Entry(baseline_group, textvariable=self.baseline_since_var, width=12).pack(side="left", padx=(0, 6))
         ttk.Button(baseline_group, text="建立/覆盖基线", command=self.init_baseline_from_gui).pack(side="left")
 
@@ -144,7 +168,8 @@ class OffboardGui(tk.Tk):
         overflow.add("清空勾选", self.clear_selection)
 
         columns = ("selected", "category", "recommendation", "owner", "confidence", "type", "title", "time")
-        self.tree = ttk.Treeview(self.dashboard, columns=columns, show="headings", selectmode="browse")
+        tree_frame = ttk.Frame(self.dashboard)
+        self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse")
         self.tree.heading("selected", text="选中", command=lambda: self.sort_by("selected"))
         self.tree.heading("category", text="分类", command=lambda: self.sort_by("category"))
         self.tree.heading("recommendation", text="推荐", command=lambda: self.sort_by("recommendation"))
@@ -174,16 +199,20 @@ class OffboardGui(tk.Tk):
         self.filter_sidebar = FilterSidebar(self.dashboard, on_change=self._apply_filters)
         self.filter_sidebar.grid(row=1, column=0, sticky="nsew", padx=(0, 6))
 
-        tree_frame = ttk.Frame(self.dashboard)
         tree_frame.grid(row=1, column=1, sticky="nsew")
         tree_frame.columnconfigure(0, weight=1)
-        tree_frame.rowconfigure(0, weight=1)
-        self.tree.grid(in_=tree_frame, row=0, column=0, sticky="nsew")
+        tree_frame.rowconfigure(1, weight=1)
+        tree_header = ttk.Frame(tree_frame)
+        tree_header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        ttk.Label(tree_header, text="候选项 / Candidates", font=("TkDefaultFont", 10, "bold")).pack(side="left")
+        self.visible_count_var = tk.StringVar(value="")
+        ttk.Label(tree_header, textvariable=self.visible_count_var, anchor="e").pack(side="right")
+        self.tree.grid(row=1, column=0, sticky="nsew")
         self.tree.bind("<Double-1>", self.toggle_current_selection)
         self.tree.bind("<space>", self.toggle_current_selection)
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
-        scrollbar.grid(row=0, column=1, sticky="ns")
+        scrollbar.grid(row=1, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=scrollbar.set)
 
         self.detail_panel = DetailPanel(self.dashboard, controller=self)
@@ -434,6 +463,7 @@ class OffboardGui(tk.Tk):
 
     def refresh_data(self, rescan: bool) -> None:
         try:
+            self.local_config = core.load_local_config(self.state_dir)
             baseline_path = self.state_dir / core.BASELINE_FILE
             if not baseline_path.exists():
                 self.candidates = []
@@ -445,7 +475,8 @@ class OffboardGui(tk.Tk):
                 self.baseline_since_var.set(str(baseline.get("baseline_since", ""))[:10])
             snapshot_path = self.state_dir / core.SNAPSHOT_FILE
             if rescan or not snapshot_path.exists():
-                snapshot = core.collect_snapshot(self.state_dir, core.default_scan_roots())
+                roots = core.resolve_scan_roots([], self.local_config)
+                snapshot = core.collect_snapshot(self.state_dir, roots, config=self.local_config)
                 core.write_json(snapshot_path, snapshot)
             else:
                 snapshot = core.read_json(snapshot_path)
@@ -472,6 +503,8 @@ class OffboardGui(tk.Tk):
             self.tree.delete(row)
         sidebar = getattr(self, "filter_sidebar", None)
         view = sidebar.apply(self.candidates) if sidebar is not None else self.candidates
+        if hasattr(self, "visible_count_var"):
+            self.visible_count_var.set(f"显示 {len(view)} / 共 {len(self.candidates)}")
         for item in self.sorted_candidates(view):
             item_id = str(item.get("id"))
             title, _detail, when = describe_item(item)
@@ -492,15 +525,23 @@ class OffboardGui(tk.Tk):
                     when,
                 ),
             )
-        # Restore focus on the same iid if it survived the re-render, and
-        # push the item into the detail panel. Otherwise show the empty state.
-        if prior_focus and self.tree.exists(prior_focus):
-            self.tree.selection_set(prior_focus)
-            self.tree.focus(prior_focus)
+        # Restore focus on the same iid if it survived the re-render. On a
+        # fresh load there is no prior focus, so select the first visible row
+        # instead; otherwise the status bar can report thousands of candidates
+        # while the detail panel still looks empty.
+        focus_iid = prior_focus if prior_focus and self.tree.exists(prior_focus) else ""
+        if not focus_iid:
+            visible_rows = self.tree.get_children()
+            focus_iid = str(visible_rows[0]) if visible_rows else ""
+        if focus_iid:
+            self.tree.selection_set(focus_iid)
+            self.tree.focus(focus_iid)
             for item in self.candidates:
-                if str(item.get("id")) == prior_focus:
+                if str(item.get("id")) == focus_iid:
                     self.detail_panel.show_item(item)
                     break
+            else:
+                self.detail_panel.show_item(None)
         else:
             self.detail_panel.show_item(None)
         counts: dict[str, int] = {}
@@ -550,7 +591,9 @@ class OffboardGui(tk.Tk):
             return
         try:
             core.parse_since(since)
-            snapshot = core.collect_snapshot(self.state_dir, core.default_scan_roots())
+            self.local_config = core.load_local_config(self.state_dir)
+            roots = core.resolve_scan_roots([], self.local_config)
+            snapshot = core.collect_snapshot(self.state_dir, roots, config=self.local_config)
             snapshot["baseline_since"] = core.parse_since(since).isoformat()
             core.write_json(self.state_dir / core.BASELINE_FILE, snapshot)
             self.selected_ids.clear()
@@ -1049,6 +1092,7 @@ def recommendation_priority(value: str) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Offboard Assistant desktop GUI.")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {core.APP_VERSION}")
     parser.add_argument("--state-dir", help="Directory containing .offboard-assistant. Default: %%APPDATA%%\\OffboardAssistant.")
     parser.add_argument(
         "--portable",

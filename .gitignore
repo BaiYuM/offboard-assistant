@@ -21,6 +21,9 @@ config.json
 # Packaging output
 build/
 dist/
+build-next/
+dist-next/
+release/
 *.spec
 
 # OS/editor noise
@@ -28,4 +31,3 @@ dist/
 Thumbs.db
 .idea/
 .vscode/
-

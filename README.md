@@ -9,8 +9,11 @@
 ```text
 offboard_assistant.py       CLI 和核心扫描/差异/清理建议逻辑
 offboard_gui.py             可视化窗口和后台任务入口
+offboard_gui_widgets.py     GUI 重型控件
+ai_reviewer.py              AI 审核与脱敏协议
 sync_bundle.py              加密导入导出与 WebDAV 同步
 test_offboard_assistant.py  单元测试
+rules/                      默认扫描规则
 build_exe.ps1               Windows EXE 打包脚本
 ```
 
@@ -24,10 +27,11 @@ build_exe.ps1               Windows EXE 打包脚本
 
 ## 快速开始
 
-如果使用已打包版本：
+如果使用已打包版本，请先完整解压 ZIP，并保留
+`OffboardAssistant.exe` 与 `_internal` 目录的相对位置：
 
 ```powershell
-.\dist\OffboardAssistant\OffboardAssistant.exe
+.\OffboardAssistant\OffboardAssistant.exe
 ```
 
 如果从源码运行：
@@ -294,24 +298,28 @@ CLI 可用 `--config <path>` 覆盖配置位置，或在配置里预填
 
 ## 打包 EXE
 
-安装打包依赖并生成窗口版 EXE：
+安装打包依赖并生成完整的 Windows one-dir ZIP 与 SHA-256 文件：
 
 ```powershell
 .\build_exe.ps1
+```
+
+如果已经安装 `requirements-packaging.txt` 中的依赖：
+
+```powershell
+.\build_exe.ps1 -SkipInstall
 ```
 
 输出位置：
 
 ```text
 dist\OffboardAssistant\OffboardAssistant.exe
+release\OffboardAssistant-windows-x64-v<APP_VERSION>.zip
+release\OffboardAssistant-windows-x64-v<APP_VERSION>.zip.sha256
 ```
 
-如果只想手动执行：
-
-```powershell
-python -m pip install -r requirements-packaging.txt
-python -m PyInstaller --noconfirm --windowed --name OffboardAssistant --add-data "README.md;." offboard_gui.py
-```
+ZIP 中包含完整的 `OffboardAssistant` 目录、`README.md` 和默认规则目录。
+不要单独分发 EXE；PyInstaller one-dir 程序还依赖同目录下的 `_internal`。
 
 `requirements-packaging.txt` 中的 `cryptography` 用于加密导出/导入和云同步包；没有它时 GUI 仍可查看清单，但加密同步不可用。
 
@@ -344,12 +352,16 @@ EXE 也支持后台参数，供 Windows 计划任务调用：
 
 ## GitHub 发布
 
-建议上传源码和配置文件，不上传本地状态或构建产物。
+源码由 Git 标签自动归档；Windows 用户应下载 Release 中的 ZIP 和对应
+`.sha256` 文件。版本标签必须严格等于 `v<offboard_assistant.APP_VERSION>`，
+例如当前应用版本 `1.0.1` 对应标签 `v1.0.1`。
 
-可以上传：
+仓库可以包含：
 
 - `offboard_assistant.py`
 - `offboard_gui.py`
+- `offboard_gui_widgets.py`
+- `ai_reviewer.py`
 - `sync_bundle.py`
 - `test_offboard_assistant.py`
 - `README.md`
@@ -359,19 +371,26 @@ EXE 也支持后台参数，供 Windows 计划任务调用：
 - `RELEASE.md`
 - `.github/workflows/`
 - `requirements-*.txt`
+- `rules/`
 - `build_exe.ps1`
 
-不要上传：
+不要提交或上传本地数据：
 
 - `.offboard-assistant/`
 - `build/`
 - `dist/`
+- `build-next/`
+- `dist-next/`
+- `release/` 本地构建目录（Release 资产由 workflow 上传）
 - `*.enc`
 - `.env`
 - `*.key`
 - `*.pem`
 
-CI 会在 Windows 上运行单元测试和编译检查。手动触发 `build-windows` workflow 可生成 Windows 构建 artifact。
+手动触发 `build-windows` workflow 会运行测试并生成 ZIP/hash artifact；推送
+匹配版本的 `v*` 标签时，同一 workflow 还会创建 GitHub Release 并附加这两个
+文件。测试、编译、版本校验或打包任一步失败，都不会执行 Release 步骤。
+完整发布流程见 [RELEASE.md](RELEASE.md)。
 
 ## 清理策略
 
